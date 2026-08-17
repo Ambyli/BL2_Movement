@@ -19,4 +19,35 @@ dependencies = [
 name = "Sliding"
 coop_support = "RequiresAllPlayers"
 license = {name = "MIT", url = "https://choosealicense.com/licenses/mit/" }
-download = "https://github.com/juso40/bl2sdk-mods/raw/refs/heads/main/sliding/sliding.sdkmod"
+download = "https://github.com/Ambyli/BL2_Movement/raw/refs/heads/main/Sliding.sdkmod"
+
+
+# --- dev tooling -----------------------------------------------------------------------------------
+# The runtime deps above (uemath, coroutines, tweens) are provided by the game's embedded Python via
+# pyunrealsdk and are not on PyPI. Do NOT `uv sync` — it will try to resolve them and fail. Set the
+# venv up with `uv venv` and install dev tools via `uv pip install --group dev`.
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.4",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "PL", "S", "BLE", "UP", "SIM", "RUF"]
+ignore = [
+    "PLR2004",  # magic numbers are the whole point of a tuning file
+    "S101",     # asserts are fine in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py.orig" = ["ALL"]
+"tests/*" = ["PLR2004", "S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
