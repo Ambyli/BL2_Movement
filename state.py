@@ -38,6 +38,8 @@ class PlayerSlideState:
     entry_x: float = 0.0
     entry_y: float = 0.0
     speed_pct: float = SLIDE_SPEED_DEFAULT
+    # Seconds this slide has been running, for the hard duration cap.
+    elapsed: float = 0.0
 
 
 CLIENTS_SLIDE_STATES: dict[WeakPointer[WillowPlayerController], PlayerSlideState] = {}
@@ -53,6 +55,7 @@ def is_client() -> bool:
 def begin_slide_state(pawn: WillowPlayerPawn, slide_data: PlayerSlideState) -> None:
     """Lock in the heading a slide was entered at."""
     slide_data.speed_pct = SLIDE_SPEED_DEFAULT
+    slide_data.elapsed = 0.0
 
     vel = Vector(pawn.Velocity)
     vel.z = 0

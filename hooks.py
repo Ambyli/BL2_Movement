@@ -9,7 +9,7 @@ from uemath import Vector
 from unrealsdk import unreal
 from unrealsdk.hooks import Type
 
-from .config import CROUCHED_PCT_DEFAULT
+from .config import CROUCHED_PCT_DEFAULT, max_duration
 from .debug import dbg
 from .lifecycle import enter_slide, exit_slide, server_set_slide_jump_velocity
 from .movement import apply_slide_physics, can_slide, slide
@@ -67,13 +67,17 @@ def handle_move(
                 state = CLIENTS_SLIDE_STATES[player]
                 slide(_pc, state, args.DeltaTime)
                 if _pc == pc:
-                    # Mirror our own speed back out, so the exit check below still sees it when we
-                    # are the host and our state lives in the clients dict rather than ours.
+                    # Mirror our own progress back out, so the exit check below still sees it when
+                    # we are the host and our state lives in the clients dict rather than ours.
                     OWN_SLIDE_STATE.speed_pct = state.speed_pct
+                    OWN_SLIDE_STATE.elapsed = state.elapsed
     else:
         slide(pc, OWN_SLIDE_STATE, args.DeltaTime)
 
-    if OWN_SLIDE_STATE.speed_pct < CROUCHED_PCT_DEFAULT:
+    if (
+        OWN_SLIDE_STATE.speed_pct < CROUCHED_PCT_DEFAULT
+        or OWN_SLIDE_STATE.elapsed >= max_duration.value
+    ):
         exit_slide(pc)
 
 

@@ -13,6 +13,7 @@ from .config import (
     SLIDE_SPEED_DEFAULT,
     SLIDE_STEER_DEADZONE,
     decay_rate,
+    max_duration,
     max_turn_degrees,
     start_speed,
     steer_rate,
@@ -41,17 +42,24 @@ def slide(
     """
     # Height difference against last frame, in unreal units.
     z_diff: float = pc.Pawn.Location.Z - slide_data.old_z
-    speed = slide_data.speed_pct
-    # Bleed off over time, lose extra going uphill, and gain a little going down.
+
+    # Time decay applies on every frame. Upstream skipped it entirely whenever the frame was
+    # downhill, so even the gentlest grade left a slide running indefinitely; now a slope only
+    # offsets the decay, and has to be genuinely steep to offset it fully.
+    speed = slide_data.speed_pct - delta_time * decay_rate.value
     if z_diff < 0:
-        speed -= z_diff * 0.0005
+        speed -= z_diff * 0.0005  # downhill, wins some speed back
     else:
-        speed -= delta_time * decay_rate.value + z_diff * 0.004
+        speed -= z_diff * 0.004  # uphill, sheds extra
+
+    # A slope may sustain a slide, but never push it past the speed it opened at.
+    speed = min(speed, SLIDE_SPEED_DEFAULT)
 
     slide_data.old_z = pc.Pawn.Location.Z
     slide_data.speed_pct = speed
+    slide_data.elapsed += delta_time
 
-    if speed < CROUCHED_PCT_DEFAULT:
+    if speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= max_duration.value:
         client_exit_slide(pc.PlayerReplicationInfo)
 
 

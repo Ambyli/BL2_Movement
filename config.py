@@ -39,12 +39,28 @@ start_speed = SliderOption(
 
 decay_rate = SliderOption(
     "Slide Decay Rate",
-    0.7,
+    1.15,
     0.2,
     3.0,
     0.05,
     is_integer=False,
-    description="How fast a slide bleeds off. Higher is a shorter slide.",
+    description=(
+        "How fast a slide bleeds off, in speed units per second. Higher is a shorter slide. The"
+        " slide runs from 2.2 down to 0.5, so 1.15 gives roughly a 1.5 second slide on the flat."
+    ),
+)
+
+max_duration = SliderOption(
+    "Max Slide Duration",
+    2.5,
+    0.5,
+    10.0,
+    0.1,
+    is_integer=False,
+    description=(
+        "Absolute cap on a single slide, in seconds. Downhill momentum can hold a slide at full"
+        " speed indefinitely; this is the backstop that ends it regardless of terrain."
+    ),
 )
 
 steer_rate = SliderOption(
@@ -71,5 +87,8 @@ max_turn_degrees = SliderOption(
 )
 
 all_options = [
-    GroupedOption("Sliding", (start_speed, decay_rate, steer_rate, max_turn_degrees)),
+    GroupedOption(
+        "Sliding",
+        (start_speed, decay_rate, max_duration, steer_rate, max_turn_degrees),
+    ),
 ]
