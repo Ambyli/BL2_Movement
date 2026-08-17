@@ -52,6 +52,11 @@ def is_client() -> bool:
     return cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().NetMode == e_net_mode.NM_Client
 
 
+def world_time() -> float:
+    """Current world time in seconds. Used to tell frames apart when deduplicating tick sources."""
+    return float(cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().TimeSeconds)
+
+
 def begin_slide_state(pawn: WillowPlayerPawn, slide_data: PlayerSlideState) -> None:
     """Lock in the heading a slide was entered at."""
     slide_data.speed_pct = SLIDE_SPEED_DEFAULT

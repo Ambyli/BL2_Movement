@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from uemath import Vector
 
@@ -20,7 +20,7 @@ from .config import (
 )
 from .debug import dbg
 from .lifecycle import client_exit_slide
-from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, PlayerSlideState
+from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, PlayerSlideState, world_time
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -124,6 +124,37 @@ def apply_slide_physics(
     dbg(f"POST pct={slide_data.speed_pct:.2f} set={speed:.0f}")
 
 
+class _HostTick:
+    """Which frame the host duty last ran on, and where it was driven from."""
+
+    last_world_time: ClassVar[float] = -1.0
+    reported_source: ClassVar[str] = ""
+
+
+def drive_hosted_slides(
+    local_pc: WillowPlayerController,
+    delta_time: float,
+    source: str,
+) -> None:
+    """Single entry point for the host duty, collapsed to once per frame.
+
+    This is driven from more than one hook so it keeps running whatever state the host is in -
+    PlayerMove stops firing the moment the host jumps or gets in a vehicle, which would strand
+    every other player's slide. The dedup matters because those hooks can both fire on the same
+    frame, and running twice would decay every slide at double rate.
+    """
+    now = world_time()
+    if now == _HostTick.last_world_time:
+        return
+    _HostTick.last_world_time = now
+
+    if _HostTick.reported_source != source:
+        _HostTick.reported_source = source
+        dbg(f"HOST TICK now driven by {source}")
+
+    tick_hosted_slides(local_pc, delta_time)
+
+
 def tick_hosted_slides(local_pc: WillowPlayerController, delta_time: float) -> None:
     """Drive every slide the host is responsible for. Host only, every frame, unconditionally.
 
@@ -158,4 +189,10 @@ def tick_hosted_slides(local_pc: WillowPlayerController, delta_time: float) -> N
                 dbg(f"REMOTE SLIDE FAILED {type(ex).__name__}: {ex}")
 
 
-__all__ = ["apply_slide_physics", "can_slide", "slide", "tick_hosted_slides"]
+__all__ = [
+    "apply_slide_physics",
+    "can_slide",
+    "drive_hosted_slides",
+    "slide",
+    "tick_hosted_slides",
+]

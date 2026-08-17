@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING, Any, cast
 from mods_base import hook
 from uemath import Vector
 from unrealsdk import unreal
-from unrealsdk.hooks import Type
+from unrealsdk.hooks import Type, add_hook, remove_hook
 
 from .config import CROUCHED_PCT_DEFAULT, max_duration
 from .debug import dbg
 from .lifecycle import enter_slide, exit_slide, server_set_slide_jump_velocity
-from .movement import apply_slide_physics, can_slide, slide, tick_hosted_slides
+from .movement import apply_slide_physics, can_slide, drive_hosted_slides, slide
 from .state import OWN_SLIDE_STATE, State, is_client
 
 if TYPE_CHECKING:
@@ -45,11 +45,11 @@ def handle_move(
     pc = cast("WillowPlayerController", obj)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
 
-    # Host duty first, and unconditionally. Everyone else's slide is driven from here, so it must
-    # not sit behind our own slide's exit checks below - it used to, which meant a client could
-    # only slide during the moments the host happened to be sliding as well.
+    # Host duty first, and unconditionally - it must not sit behind our own slide's exit checks
+    # below. Usually the player tick hook has already covered this frame and the call is a no-op;
+    # it stays as a fallback for the case where that hook never registers.
     if not is_client():
-        tick_hosted_slides(pc, args.DeltaTime)
+        drive_hosted_slides(pc, args.DeltaTime, "PlayerMove")
 
     # Jumping stands you up, which fails the slide exit conditions below, so the slide jump has to
     # be handled before any of them get a chance to run.
@@ -111,6 +111,58 @@ def handle_duck(
             enter_slide(pc)
         except Exception as ex:  # noqa: BLE001 - temporary diagnostics
             dbg(f"ENTER FAILED {type(ex).__name__}: {ex}")
+
+
+# --- host tick -----------------------------------------------------------------------------------
+# PlayerMove only fires while the host is in the walking state, so the moment the host jumps, boards
+# a vehicle or opens a menu it stops driving everyone else's slide. PlayerTick runs every frame in
+# every state, which is what the host duty actually needs.
+#
+# Registered by hand rather than with the decorator because it is not knowable from outside the game
+# whether WillowPlayerController overrides PlayerTick or inherits it - hooking the wrong one would
+# silently never fire. Both are attempted; if the override exists and chains to its parent then both
+# fire, which the per-frame dedup in drive_hosted_slides already handles.
+
+HOST_TICK_ID = "SlidingHostTick"
+PLAYER_TICK_FUNCS = (
+    "WillowGame.WillowPlayerController:PlayerTick",
+    "Engine.PlayerController:PlayerTick",
+)
+
+
+def _host_tick(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    if is_client():
+        return
+    delta_time = float(getattr(args, "DeltaTime", 0.0) or 0.0)
+    if delta_time <= 0.0:
+        return
+    try:
+        drive_hosted_slides(cast("WillowPlayerController", obj), delta_time, "PlayerTick")
+    except Exception as ex:  # noqa: BLE001 - must never break the controller's tick
+        dbg(f"HOST TICK FAILED {type(ex).__name__}: {ex}")
+
+
+def enable_host_tick() -> None:
+    for name in PLAYER_TICK_FUNCS:
+        try:
+            added = add_hook(name, Type.PRE, HOST_TICK_ID, _host_tick)
+        except Exception as ex:  # noqa: BLE001 - a missing candidate is expected, not fatal
+            dbg(f"HOST TICK could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        dbg(f"HOST TICK hook on {name}: {'added' if added else 'refused'}")
+
+
+def disable_host_tick() -> None:
+    for name in PLAYER_TICK_FUNCS:
+        try:
+            remove_hook(name, Type.PRE, HOST_TICK_ID)
+        except Exception:  # noqa: BLE001, S110 - nothing useful to do if it was never added
+            pass
 
 
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
