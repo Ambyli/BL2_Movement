@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from uemath import Vector
 
@@ -20,7 +20,7 @@ from .config import (
 )
 from .debug import dbg
 from .lifecycle import client_exit_slide
-from .state import OWN_SLIDE_STATE, PlayerSlideState
+from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, PlayerSlideState
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -124,4 +124,38 @@ def apply_slide_physics(
     dbg(f"POST pct={slide_data.speed_pct:.2f} set={speed:.0f}")
 
 
-__all__ = ["apply_slide_physics", "can_slide", "slide"]
+def tick_hosted_slides(local_pc: WillowPlayerController, delta_time: float) -> None:
+    """Drive every slide the host is responsible for. Host only, every frame, unconditionally.
+
+    BL2 is server authoritative over movement, so a remote player's slide has to be forced on the
+    server too. Without it the host simulates them from their replicated input - which, mid-slide
+    with no key held, is nothing - decides they should be stationary, and corrects them out of the
+    slide as fast as they predict themselves into it.
+
+    Our own entry is only decayed here, not forced: the local pawn is driven from the post hook
+    instead, after PlayerMove has stopped overwriting it.
+    """
+    for player in CLIENTS_SLIDE_STATES.copy():
+        if (_pc := player()) is None:
+            CLIENTS_SLIDE_STATES.pop(player)
+            continue
+
+        state = CLIENTS_SLIDE_STATES[player]
+        if not state.is_sliding:
+            continue
+
+        slide(_pc, state, delta_time)
+
+        if _pc == local_pc:
+            # Mirror our own progress out, so the local exit checks still see it when we are the
+            # host and our state lives in this dict rather than in OWN_SLIDE_STATE.
+            OWN_SLIDE_STATE.speed_pct = state.speed_pct
+            OWN_SLIDE_STATE.elapsed = state.elapsed
+        elif _pc.Pawn is not None:
+            try:
+                apply_slide_physics(cast("WillowPlayerPawn", _pc.Pawn), state, delta_time)
+            except Exception as ex:  # noqa: BLE001 - one bad pawn must not stall the others
+                dbg(f"REMOTE SLIDE FAILED {type(ex).__name__}: {ex}")
+
+
+__all__ = ["apply_slide_physics", "can_slide", "slide", "tick_hosted_slides"]

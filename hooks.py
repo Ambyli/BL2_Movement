@@ -12,8 +12,8 @@ from unrealsdk.hooks import Type
 from .config import CROUCHED_PCT_DEFAULT, max_duration
 from .debug import dbg
 from .lifecycle import enter_slide, exit_slide, server_set_slide_jump_velocity
-from .movement import apply_slide_physics, can_slide, slide
-from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, State, is_client
+from .movement import apply_slide_physics, can_slide, slide, tick_hosted_slides
+from .state import OWN_SLIDE_STATE, State, is_client
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -45,6 +45,12 @@ def handle_move(
     pc = cast("WillowPlayerController", obj)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
 
+    # Host duty first, and unconditionally. Everyone else's slide is driven from here, so it must
+    # not sit behind our own slide's exit checks below - it used to, which meant a client could
+    # only slide during the moments the host happened to be sliding as well.
+    if not is_client():
+        tick_hosted_slides(pc, args.DeltaTime)
+
     # Jumping stands you up, which fails the slide exit conditions below, so the slide jump has to
     # be handled before any of them get a chance to run.
     if State.do_slide_jump:
@@ -59,19 +65,8 @@ def handle_move(
         exit_slide(pc)
         return
 
-    if not is_client():
-        for player in CLIENTS_SLIDE_STATES.copy():
-            if (_pc := player()) is None:
-                CLIENTS_SLIDE_STATES.pop(player)
-            else:
-                state = CLIENTS_SLIDE_STATES[player]
-                slide(_pc, state, args.DeltaTime)
-                if _pc == pc:
-                    # Mirror our own progress back out, so the exit check below still sees it when
-                    # we are the host and our state lives in the clients dict rather than ours.
-                    OWN_SLIDE_STATE.speed_pct = state.speed_pct
-                    OWN_SLIDE_STATE.elapsed = state.elapsed
-    else:
+    # A client owns only its own slide; the host already advanced its entry above.
+    if is_client():
         slide(pc, OWN_SLIDE_STATE, args.DeltaTime)
 
     if (
