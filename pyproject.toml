@@ -1,7 +1,7 @@
 [project]
 name = "sliding"
 version = "1.0"
-authors = [{ name = "juso" }]
+authors = [{ name = "Ambyli" }]
 description = """\
 *Adds sliding to BL2/TPS/AoDK.*  
 Pressing crouch while sprinting will make you slide.
