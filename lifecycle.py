@@ -31,6 +31,7 @@ from .state import (
     PlayerSlideState,
     begin_slide_state,
     is_client,
+    set_slide_heading,
 )
 
 if TYPE_CHECKING:
@@ -59,7 +60,12 @@ def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
     dbg(f"SERVER_JUMP from={pc.PlayerReplicationInfo.PlayerName} vel=({vel_x:.0f},{vel_y:.0f})")
 
 
-def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
+def begin_server_slide(
+    pc: WillowPlayerController,
+    source: str,
+    dir_x: float | None = None,
+    dir_y: float | None = None,
+) -> bool:
     """Start, or restart, the host's copy of a player's slide. Idempotent.
 
     Split out of the network message so the move-flag channel can drive it too. Both routes are
@@ -77,7 +83,12 @@ def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
         elif _pc == pc:
             data = CLIENTS_SLIDE_STATES[player]
             if data.is_sliding:
-                return False  # already running - a duplicate from the other route
+                # Already running, from the other route. Not a no-op if this call brought the
+                # heading with it - the client's word on direction beats the host's guess, whichever
+                # route happened to start the slide.
+                if dir_x is not None and dir_y is not None:
+                    set_slide_heading(data, dir_x, dir_y)
+                return False
             data.is_sliding = True
             data.old_z = pawn.Location.Z
             begin_slide_state(cast("WillowPlayerPawn", pawn), data)
@@ -87,8 +98,16 @@ def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
         begin_slide_state(cast("WillowPlayerPawn", pawn), data)
         CLIENTS_SLIDE_STATES[unreal.WeakPointer(pc)] = data
 
+    # begin_slide_state guessed a heading from the pawn's velocity. Replace it if the client told us
+    # what it actually is - the guess is only there for the flag route, which carries no direction.
+    if dir_x is not None and dir_y is not None:
+        set_slide_heading(data, dir_x, dir_y)
+
     pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
-    dbg(f"SLIDE_ON via={source} who={pc.PlayerReplicationInfo.PlayerName} n={len(CLIENTS_SLIDE_STATES)}")
+    dbg(
+        f"SLIDE_ON via={source} who={pc.PlayerReplicationInfo.PlayerName}"
+        f" dir=({data.dir_x:.2f},{data.dir_y:.2f}) n={len(CLIENTS_SLIDE_STATES)}",
+    )
     return True
 
 
@@ -118,22 +137,29 @@ def server_exit_slide() -> None:
     end_server_slide(cast("WillowPlayerController", server_exit_slide.sender.Owner), "message")
 
 
-@broadcast.message
-def server_enter_slide() -> None:
+@broadcast.json_message
+def server_enter_slide(dir_x: float, dir_y: float) -> None:
     if is_client():
         return
-    begin_server_slide(cast("WillowPlayerController", server_enter_slide.sender.Owner), "message")
+    begin_server_slide(
+        cast("WillowPlayerController", server_enter_slide.sender.Owner),
+        "message",
+        dir_x,
+        dir_y,
+    )
 
 
 def enter_slide(pc: WillowPlayerController) -> None:
     """The client wants to slide; tells the host, but starts its own presentation immediately."""
     if OWN_SLIDE_STATE.is_sliding:
         return
-    server_enter_slide()
     OWN_SLIDE_STATE.is_sliding = True
     OWN_SLIDE_STATE.old_z = pc.Pawn.Location.Z
     begin_slide_state(cast("WillowPlayerPawn", pc.Pawn), OWN_SLIDE_STATE)
     pc.Pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
+    # Announced only after the heading exists. Sending first would transmit the *previous* slide's
+    # direction, which is the same class of bug as the host guessing one.
+    server_enter_slide(OWN_SLIDE_STATE.dir_x, OWN_SLIDE_STATE.dir_y)
     dbg(
         f"ENTER_OWN client={is_client()} speed={start_speed.value:.0f} "
         f"dir=({OWN_SLIDE_STATE.dir_x:.2f},{OWN_SLIDE_STATE.dir_y:.2f}) "

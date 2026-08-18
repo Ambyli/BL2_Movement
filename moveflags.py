@@ -35,7 +35,7 @@ from unrealsdk.hooks import Block, Type, add_hook, prevent_hooking_direct_calls,
 
 from .debug import dbg
 from .lifecycle import begin_server_slide, end_server_slide
-from .state import OWN_SLIDE_STATE, is_client
+from .state import OWN_SLIDE_STATE, is_client, world_time
 
 if TYPE_CHECKING:
     from unrealsdk import unreal
@@ -44,6 +44,16 @@ if TYPE_CHECKING:
 
 SLIDE_FLAG_BIT: int = 0x80
 """The one bit nothing else claims. See the layout in the module docstring."""
+
+FLAG_STOP_GRACE: float = 0.25
+"""How long the bit must be absent before the host calls the slide over, in seconds.
+
+Not zero, because absence of the bit on a single move does not mean the slide ended. UE3 sends more
+than the newest move - `DualServerMove` and `OldServerMove` carry earlier ones, and those legitimately
+predate the slide. Treating each of those as a stop made the host end and restart the slide many
+times a second, and every restart re-derived the heading from the velocity the host itself was
+forcing, which is what pinned every client slide to one direction.
+"""
 
 INJECT_ID = "SlidingFlagInject"
 READ_ID = "SlidingFlagRead"
@@ -63,6 +73,7 @@ class _Flags:
     """
 
     last_seen: ClassVar[dict[int, bool]] = {}
+    last_bit_at: ClassVar[dict[int, float]] = {}
     injected: ClassVar[int] = 0
     reported_inject: ClassVar[bool] = False
     reported_read: ClassVar[bool] = False
@@ -104,9 +115,10 @@ def _read_slide_flag(
 ) -> None:
     """Start or stop the host's copy of a slide from the flag on the move. Host side.
 
-    Edge triggered: a slide begins on the first move carrying the bit and ends on the first move
-    without it. That places both transitions on exactly the move the client made them on, which a
-    queued message cannot do.
+    A slide begins on the first move carrying the bit - on exactly the move the client started it,
+    which a queued message cannot manage. Ending is deliberately not symmetric: it waits for the bit
+    to stay absent, because a single move without it usually means an older move arrived late rather
+    than that the slide is over. See FLAG_STOP_GRACE.
     """
     if is_client():
         return
@@ -121,17 +133,29 @@ def _read_slide_flag(
         _Flags.reported_read = True
         dbg("FLAG read live")
 
+    now = world_time()
     was = _Flags.last_seen.get(player_id, False)
-    if sliding == was:
-        return
-    _Flags.last_seen[player_id] = sliding
 
-    try:
-        if sliding:
+    if sliding:
+        _Flags.last_bit_at[player_id] = now
+        if was:
+            return
+        _Flags.last_seen[player_id] = True
+        try:
             begin_server_slide(pc, "flag")
-        else:
-            end_server_slide(pc, "flag")
-    except Exception as ex:  # noqa: BLE001 - must never break the move path
+        except Exception as ex:  # noqa: BLE001 - must never break the move path
+            dbg(f"FLAG EDGE FAILED {type(ex).__name__}: {ex}")
+        return
+
+    if not was:
+        return
+    # Bit missing. Only believe it once the bit has stayed missing for a while - see FLAG_STOP_GRACE.
+    if now - _Flags.last_bit_at.get(player_id, 0.0) < FLAG_STOP_GRACE:
+        return
+    _Flags.last_seen[player_id] = False
+    try:
+        end_server_slide(pc, "flag")
+    except Exception as ex:  # noqa: BLE001
         dbg(f"FLAG EDGE FAILED {type(ex).__name__}: {ex}")
 
 
@@ -165,6 +189,7 @@ def disable_move_flags() -> None:
         except Exception:  # noqa: BLE001, S110
             pass
     _Flags.last_seen.clear()
+    _Flags.last_bit_at.clear()
 
 
 def injected_count() -> int:
