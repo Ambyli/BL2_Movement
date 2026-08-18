@@ -40,6 +40,9 @@ class PlayerSlideState:
     speed_pct: float = SLIDE_SPEED_DEFAULT
     # Seconds this slide has been running, for the hard duration cap.
     elapsed: float = 0.0
+    # Where the host's copy of this pawn stood when the slide opened, to measure whether it followed.
+    server_start_x: float = 0.0
+    server_start_y: float = 0.0
 
 
 CLIENTS_SLIDE_STATES: dict[WeakPointer[WillowPlayerController], PlayerSlideState] = {}

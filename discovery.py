@@ -119,7 +119,7 @@ MAX_MOVEFLAG_FIRES: int = 40
 SERVERMOVE_ID = "SlidingDiscoveryServerMove"
 MAX_SERVERMOVE_FIRES: int = 40
 MAX_NETCODE_HOOKS: int = 12
-MAX_NETCODE_FIRES: int = 25
+MAX_NETCODE_FIRES: int = 40
 
 # The transport probe. The networking library moves every message over these two engine functions,
 # so watching them on both machines says exactly where a message stops: never sent, sent but not
@@ -817,7 +817,10 @@ def _netcode_probe(
     rubberband. The args carry the position the server is asserting, which is the number that says
     how far the two simulations have drifted apart.
     """
-    if not OWN_SLIDE_STATE.is_sliding:
+    # Also log across the teleport watch window, not only during the slide. The correction that
+    # actually moves the player lands several frames *after* the slide ends, so a slide-only filter
+    # hid the single most important packet in every log gathered so far.
+    if not OWN_SLIDE_STATE.is_sliding and _Progress.watch_frames <= 0:
         return
     try:
         name = str(func.func.Name)
@@ -833,7 +836,20 @@ def _netcode_probe(
         here = f"({location.X:.0f},{location.Y:.0f},{location.Z:.0f})"
     except Exception:  # noqa: BLE001 - some of these are called on the pawn, not the controller
         here = "?"
-    note(f"NET #{count} {name} client={is_client()} at={here} args=({_describe_args(args)})")
+    when = "during" if OWN_SLIDE_STATE.is_sliding else f"after+{TELEPORT_WATCH_FRAMES - _Progress.watch_frames}"
+    moved = "?"
+    try:
+        location = obj.Pawn.Location
+        dx = float(args.NewLocX) - float(location.X)
+        dy = float(args.NewLocY) - float(location.Y)
+        dz = float(args.NewLocZ) - float(location.Z)
+        moved = f"{(dx * dx + dy * dy + dz * dz) ** 0.5:.0f}"
+    except Exception:  # noqa: BLE001 - variant without these args
+        pass
+    note(
+        f"NET #{count} {name} {when} client={is_client()} at={here} asserts_move={moved}"
+        f" args=({_describe_args(args)})",
+    )
 
 
 def _scan_functions() -> None:
