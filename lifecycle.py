@@ -4,6 +4,14 @@ The network messages live here rather than in a module of their own on purpose: 
 `server_exit_slide`, and the targeted `client_exit_slide` calls `exit_slide` straight back. They are
 two halves of one protocol, and splitting them would buy a tidier file listing at the cost of a
 genuine import cycle.
+
+The server bound messages are `broadcast` rather than `host`, which reads oddly for messages only
+the host acts on. It is deliberate. `host` addresses a message by finding whichever player has
+`bIsPartyLeader` set, re-finds them by player id a frame later when the queue flushes, and silently
+drops the message if either step misses. Logs from a real session showed nine client slides produce
+zero arrivals on the host, while the host's own slides - which never leave the machine - arrived
+every time. `broadcast` does no addressing at all, so none of those steps can fail. The cost is that
+every machine runs these bodies, hence the client guards: this state belongs to the host alone.
 """
 
 from __future__ import annotations
@@ -11,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 from mods_base import get_pc
-from networking.decorators import host, targeted
+from networking.decorators import broadcast, targeted
 from unrealsdk import unreal
 
 from . import events
@@ -29,15 +37,19 @@ if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
 
 
-@host.json_message
+@broadcast.json_message
 def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
+    if is_client():
+        return
     pc = cast("WillowPlayerController", server_set_slide_jump_velocity.sender.Owner)
     pc.Pawn.Velocity.X = vel_x
     pc.Pawn.Velocity.Y = vel_y
 
 
-@host.message
+@broadcast.message
 def server_exit_slide() -> None:
+    if is_client():
+        return
     pc = cast("WillowPlayerController", server_exit_slide.sender.Owner)
     pc.Pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
     for player in CLIENTS_SLIDE_STATES.copy():
@@ -47,8 +59,10 @@ def server_exit_slide() -> None:
             CLIENTS_SLIDE_STATES[player].is_sliding = False
 
 
-@host.message
+@broadcast.message
 def server_enter_slide() -> None:
+    if is_client():
+        return
     pc = cast("WillowPlayerController", server_enter_slide.sender.Owner)
 
     for player in CLIENTS_SLIDE_STATES.copy():

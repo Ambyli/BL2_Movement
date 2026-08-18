@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from mods_base import ENGINE
 from unrealsdk import find_all
 from unrealsdk.hooks import Type, add_hook, remove_hook
 
@@ -67,6 +68,18 @@ NETCODE_HOOK_WORDS = ("adjustposition", "setlocation", "moveautonomous")
 MAX_NETCODE_HOOKS: int = 12
 MAX_NETCODE_FIRES: int = 10
 
+# The transport probe. The networking library moves every message over these two engine functions,
+# so watching them on both machines says exactly where a message stops: never sent, sent but not
+# received, or received under an identifier nobody is listening for.
+TRANSPORT_ID = "SlidingDiscoveryTransport"
+TRANSPORT_FUNCS = (
+    "Engine.PlayerController:ServerSpeech",
+    "WillowGame.WillowPlayerController:ClientMessage",
+    "Engine.PlayerController:ClientMessage",
+)
+CUSTOM_MESSAGE_PREFIX = "!willow_nw:"
+MAX_TRANSPORT_FIRES: int = 30
+
 HUD_ID = "SlidingDiscoveryHud"
 FOOTSTEP_ID = "SlidingDiscoveryFootstep"
 NETCODE_ID = "SlidingDiscoveryNetcode"
@@ -87,6 +100,8 @@ class _Progress:
     seen_akevents: ClassVar[set[str]] = set()
     fires: ClassVar[dict[str, int]] = {}
     netcode_fires: ClassVar[dict[str, int]] = {}
+    transport_fires: ClassVar[int] = 0
+    dumped_identity: ClassVar[bool] = False
     last_fire_args: ClassVar[dict[str, str]] = {}
     dumped_surface_props: ClassVar[bool] = False
     hud_seen: ClassVar[set[str]] = set()
@@ -349,6 +364,86 @@ def _footstep_probe(
     note(f"FOOTSTEP #{count} {name} on={_short(obj)} args=({described})")
 
 
+def _transport_probe(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    func: unreal.BoundFunction,
+) -> None:
+    """Log every mod network message crossing the wire, on whichever machine sees it.
+
+    Unfiltered by slide state on purpose - the question is whether the message moves at all, and a
+    message that is never sent would be invisible to a slide-filtered probe.
+    """
+    if _Progress.transport_fires >= MAX_TRANSPORT_FIRES:
+        return
+    try:
+        # ServerSpeech names it Type; ClientMessage does too, but its payload field differs.
+        msg_type = str(args.Type)
+    except Exception:  # noqa: BLE001 - not one of ours, or no such field
+        return
+    if not msg_type.startswith(CUSTOM_MESSAGE_PREFIX):
+        return
+
+    _Progress.transport_fires += 1
+    try:
+        name = str(func.func.Name)
+    except Exception:  # noqa: BLE001
+        name = "?"
+    try:
+        who = str(obj.PlayerReplicationInfo.PlayerName)
+    except Exception:  # noqa: BLE001
+        who = "?"
+    note(f"XPORT #{_Progress.transport_fires} {name} client={is_client()} on={who} type={msg_type}")
+
+
+def _dump_network_identity(pc: WillowPlayerController) -> None:
+    """Record who this machine thinks everyone is, and what identifiers it is listening for.
+
+    Three things can silently swallow a message: the identifiers not matching between the two
+    machines, `get_host_pri` picking the wrong player, or it picking *this* player - in which case
+    the message is handled locally and never sent at all. All three are visible here.
+    """
+    if _Progress.dumped_identity:
+        return
+    _Progress.dumped_identity = True
+
+    try:
+        from networking.registration import registered_callbacks  # noqa: PLC0415
+
+        listening = sorted(k for k in registered_callbacks if "slid" in k.lower())
+        note(f"NETID listening_for={listening}")
+    except Exception as ex:  # noqa: BLE001
+        note(f"NETID registered_callbacks unreadable: {type(ex).__name__}: {ex}")
+
+    try:
+        local_pri = pc.PlayerReplicationInfo
+        note(f"NETID local={local_pri.PlayerName} id={local_pri.PlayerID} client={is_client()}")
+    except Exception as ex:  # noqa: BLE001
+        note(f"NETID local pri unreadable: {type(ex).__name__}: {ex}")
+        return
+
+    try:
+        from networking.transmission import get_host_pri  # noqa: PLC0415
+
+        host_pri = get_host_pri()
+        note(
+            f"NETID host={host_pri.PlayerName} id={host_pri.PlayerID}"
+            f" is_self={host_pri == local_pri}",
+        )
+    except Exception as ex:  # noqa: BLE001 - StopIteration here means no party leader is flagged
+        note(f"NETID get_host_pri FAILED: {type(ex).__name__}: {ex}")
+
+    try:
+        roster = [
+            (str(pri.PlayerName), int(pri.PlayerID), bool(pri.bIsPartyLeader))
+            for pri in ENGINE.GetCurrentWorldInfo().GRI.PRIArray
+        ]
+        note(f"NETID roster(name,id,isPartyLeader)={roster}")
+    except Exception as ex:  # noqa: BLE001
+        note(f"NETID roster unreadable: {type(ex).__name__}: {ex}")
+
+
 def _netcode_probe(
     obj: unreal.UObject,
     args: unreal.WrappedStruct,
@@ -512,6 +607,7 @@ def on_start(pc: WillowPlayerController) -> None:
     """Subscribed to `slide_started`. Everything expensive here is one-shot or throttled."""
     if not DISCOVERY:
         return
+    _dump_network_identity(pc)
     _scan_functions()
     _dump_animtree(pc)
     _dump_surface_props(pc)
@@ -532,6 +628,16 @@ def enable() -> None:
     _Progress.hud_seen = set()
     _Progress.fires = {}
     note("=== sliding discovery ===")
+
+    for name in TRANSPORT_FUNCS:
+        try:
+            added = add_hook(name, Type.PRE, TRANSPORT_ID, _transport_probe)
+        except Exception as ex:  # noqa: BLE001 - a missing candidate is expected, not fatal
+            note(f"XPORT could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        if added:
+            _Progress.pre_hooks.append(name)
+        note(f"XPORT hook {name}: {'added' if added else 'refused'}")
 
     for name in HUD_FUNCS:
         try:
@@ -556,7 +662,7 @@ def disable() -> None:
     for name in _Progress.pre_hooks:
         # One list holds both kinds, and removing an identifier that was never added is harmless, so
         # try both rather than tracking which probe claimed which name.
-        for identifier in (FOOTSTEP_ID, NETCODE_ID):
+        for identifier in (FOOTSTEP_ID, NETCODE_ID, TRANSPORT_ID):
             try:
                 remove_hook(name, Type.PRE, identifier)
             except Exception:  # noqa: BLE001, S110
