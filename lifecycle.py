@@ -123,3 +123,18 @@ network_functions = [
     server_enter_slide,
     client_exit_slide,
 ]
+
+# --- wire identifiers ------------------------------------------------------------------------------
+# Pinned, rather than left to the library default of "<module>:<qualname>". That default begins with
+# the mod's *directory name*, so the same mod unzipped into `sliding` on one machine and
+# `BL2_Movement-main` on another produces different identifiers, and every message is discarded on
+# arrival as unknown - in both directions, with nothing but a console warning to show for it. That is
+# not hypothetical; it is what two session logs showed after the rest of the transport was proven
+# working. A GitHub zip extracts as `<repo>-main`, so the mismatch recurs on every fresh download.
+#
+# Pinning the prefix makes the protocol depend on the mod, not on where somebody happened to put it.
+# Both players still need matching builds, but they no longer need matching folder names.
+PROTOCOL_PREFIX = "sliding"
+
+for _func in network_functions:
+    _func.network_identifier = f"{PROTOCOL_PREFIX}:{_func.__wrapped__.__qualname__}"
