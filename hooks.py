@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+import contextlib
+from typing import TYPE_CHECKING, Any, cast
 
 from mods_base import hook
 from uemath import Vector
@@ -57,7 +58,9 @@ def handle_move(
         if pawn.IsOnGroundOrShortFall():
             pawn.DoJump(True)
         else:
-            server_set_slide_jump_velocity(State.horizontal_velocity.x, State.horizontal_velocity.y)
+            server_set_slide_jump_velocity(
+                State.horizontal_velocity.x, State.horizontal_velocity.y
+            )
             State.do_slide_jump = False
             return
 
@@ -142,7 +145,9 @@ def _host_tick(
     if delta_time <= 0.0:
         return
     try:
-        drive_hosted_slides(cast("WillowPlayerController", obj), delta_time, "PlayerTick")
+        drive_hosted_slides(
+            cast("WillowPlayerController", obj), delta_time, "PlayerTick"
+        )
     except Exception as ex:  # noqa: BLE001 - must never break the controller's tick
         dbg(f"HOST TICK FAILED {type(ex).__name__}: {ex}")
 
@@ -151,7 +156,9 @@ def enable_host_tick() -> None:
     for name in PLAYER_TICK_FUNCS:
         try:
             added = add_hook(name, Type.PRE, HOST_TICK_ID, _host_tick)
-        except Exception as ex:  # noqa: BLE001 - a missing candidate is expected, not fatal
+        except (
+            Exception
+        ) as ex:  # noqa: BLE001 - a missing candidate is expected, not fatal
             dbg(f"HOST TICK could not hook {name}: {type(ex).__name__}: {ex}")
             continue
         dbg(f"HOST TICK hook on {name}: {'added' if added else 'refused'}")
@@ -159,10 +166,9 @@ def enable_host_tick() -> None:
 
 def disable_host_tick() -> None:
     for name in PLAYER_TICK_FUNCS:
-        try:
+        # A missing hook is expected - it may have failed to register on `enable_host_tick`.
+        with contextlib.suppress(Exception):
             remove_hook(name, Type.PRE, HOST_TICK_ID)
-        except Exception:  # noqa: BLE001, S110 - nothing useful to do if it was never added
-            pass
 
 
 # --- correction suppression ------------------------------------------------------------------------
@@ -238,7 +244,9 @@ def enable_correction_suppression() -> None:
     for name in CORRECTION_FUNCS:
         try:
             added = add_hook(name, Type.PRE, CORRECTION_ID, _suppress_correction)
-        except Exception as ex:  # noqa: BLE001 - a missing variant is expected, not fatal
+        except (
+            Exception
+        ) as ex:  # noqa: BLE001 - a missing variant is expected, not fatal
             dbg(f"SUPPRESS could not hook {name}: {type(ex).__name__}: {ex}")
             continue
         dbg(f"SUPPRESS hook on {name}: {'added' if added else 'refused'}")

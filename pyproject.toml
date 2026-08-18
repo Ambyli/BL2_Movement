@@ -36,6 +36,7 @@ dev = [
 [tool.ruff]
 line-length = 120
 target-version = "py314"
+extend-exclude = ["__init__.py.orig"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "PL", "S", "BLE", "UP", "SIM", "RUF"]
@@ -46,7 +47,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py.orig" = ["ALL"]
-"tests/*" = ["PLR2004", "S101"]
+# Test helpers legitimately need more args than five (mirroring game APIs, driving multi-frame sims).
+"tests/*" = ["PLR2004", "S101", "PLR0913", "PLR0917"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

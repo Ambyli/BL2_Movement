@@ -23,5 +23,40 @@ All exposed as live sliders in the mod menu — changes take effect without a re
 ## Co-op
 Requires the mod on every player in the session. Movement is host-authoritative, so remote players slide correctly whatever the host is doing — jumping, driving, or sitting in a menu.
 
+## Development
+
+The mod runs inside Borderlands' embedded Python interpreter (shipped with pyunrealsdk), so the runtime dependencies — `unrealsdk`, `mods_base`, `networking`, `uemath`, `coroutines`, `tweens` — are game-provided rather than installable from PyPI. A local virtual environment is only for dev tooling: linting and unit tests.
+
+### Setup
+
+Requires [`uv`](https://docs.astral.sh/uv/) and Python 3.14 on the local machine.
+
+```
+uv venv --python 3.14
+uv pip install --group dev
+```
+
+Do **not** run `uv sync` — it will try to resolve the runtime dependencies against PyPI and fail. Use `uv pip install --group dev` to install only the dev tools (ruff and pytest).
+
+### Tests
+
+```
+uv run --no-sync pytest
+```
+
+The `--no-sync` flag skips uv's implicit dependency resolution — the mod's runtime dependencies aren't on PyPI, so bare `uv run` would fail before pytest even started.
+
+The suite covers the pure slide math: entry-heading lock in `state.begin_slide_state`, the decay curve and exit triggers in `movement.slide`, and the steering blend / back-input filter / turn-cone clamp / pawn writes in `movement.apply_slide_physics`. Tests never load the game — `tests/conftest.py` installs stand-in modules into `sys.modules` before any test imports the mod, with a working `Vector` implementation for the vector math and minimal fakes for everything else.
+
+When adding tests for new pure-math paths, extend `conftest.py` if the code touches a game API not already stubbed. Anything that reaches through hooks or replication is out of scope here and needs to be verified in-game.
+
+### Lint
+
+```
+uv run --no-sync ruff check .
+```
+
+Ruff rules and per-file exceptions live in `pyproject.toml` under `[tool.ruff]`.
+
 ## Credits
 Fork of [juso40's original Sliding mod](https://github.com/juso40/bl2sdk-mods). The movement core has been rewritten around a host-driven state model with steering, a turn-limit backstop, and a locked slide speed.
