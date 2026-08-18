@@ -59,41 +59,70 @@ def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
     dbg(f"SERVER_JUMP from={pc.PlayerReplicationInfo.PlayerName} vel=({vel_x:.0f},{vel_y:.0f})")
 
 
-@broadcast.message
-def server_exit_slide() -> None:
-    if is_client():
-        return
-    pc = cast("WillowPlayerController", server_exit_slide.sender.Owner)
-    pc.Pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-    for player in CLIENTS_SLIDE_STATES.copy():
-        if (_pc := player()) is None:
-            CLIENTS_SLIDE_STATES.pop(player)
-        elif _pc == pc:
-            CLIENTS_SLIDE_STATES[player].is_sliding = False
+def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
+    """Start, or restart, the host's copy of a player's slide. Idempotent.
 
+    Split out of the network message so the move-flag channel can drive it too. Both routes are
+    live at once and both land here; whichever arrives first wins and the other is a no-op, which is
+    what makes it safe to run them in parallel while we find out which is actually quicker.
 
-@broadcast.message
-def server_enter_slide() -> None:
-    if is_client():
-        return
-    pc = cast("WillowPlayerController", server_enter_slide.sender.Owner)
+    Returns True if this call was the one that started it.
+    """
+    if is_client() or (pawn := pc.Pawn) is None:
+        return False
 
     for player in CLIENTS_SLIDE_STATES.copy():
         if (_pc := player()) is None:
             CLIENTS_SLIDE_STATES.pop(player)
         elif _pc == pc:
             data = CLIENTS_SLIDE_STATES[player]
+            if data.is_sliding:
+                return False  # already running - a duplicate from the other route
             data.is_sliding = True
-            data.old_z = pc.Pawn.Location.Z
-            begin_slide_state(cast("WillowPlayerPawn", pc.Pawn), data)
+            data.old_z = pawn.Location.Z
+            begin_slide_state(cast("WillowPlayerPawn", pawn), data)
             break
     else:
-        data = PlayerSlideState(old_z=pc.Pawn.Location.Z, is_sliding=True)
-        begin_slide_state(cast("WillowPlayerPawn", pc.Pawn), data)
+        data = PlayerSlideState(old_z=pawn.Location.Z, is_sliding=True)
+        begin_slide_state(cast("WillowPlayerPawn", pawn), data)
         CLIENTS_SLIDE_STATES[unreal.WeakPointer(pc)] = data
 
-    pc.Pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
-    dbg(f"SERVER_ENTER from={pc.PlayerReplicationInfo.PlayerName} clients={len(CLIENTS_SLIDE_STATES)}")
+    pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
+    dbg(f"SLIDE_ON via={source} who={pc.PlayerReplicationInfo.PlayerName} n={len(CLIENTS_SLIDE_STATES)}")
+    return True
+
+
+def end_server_slide(pc: WillowPlayerController, source: str) -> bool:
+    """Stop the host's copy of a player's slide. Idempotent, for the same reason."""
+    if is_client():
+        return False
+    if (pawn := pc.Pawn) is not None:
+        pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
+
+    stopped = False
+    for player in CLIENTS_SLIDE_STATES.copy():
+        if (_pc := player()) is None:
+            CLIENTS_SLIDE_STATES.pop(player)
+        elif _pc == pc and CLIENTS_SLIDE_STATES[player].is_sliding:
+            CLIENTS_SLIDE_STATES[player].is_sliding = False
+            stopped = True
+    if stopped:
+        dbg(f"SLIDE_OFF via={source} who={pc.PlayerReplicationInfo.PlayerName}")
+    return stopped
+
+
+@broadcast.message
+def server_exit_slide() -> None:
+    if is_client():
+        return
+    end_server_slide(cast("WillowPlayerController", server_exit_slide.sender.Owner), "message")
+
+
+@broadcast.message
+def server_enter_slide() -> None:
+    if is_client():
+        return
+    begin_server_slide(cast("WillowPlayerController", server_enter_slide.sender.Owner), "message")
 
 
 def enter_slide(pc: WillowPlayerController) -> None:

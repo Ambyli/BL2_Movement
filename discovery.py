@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from mods_base import ENGINE
-from unrealsdk import find_all
+from unrealsdk import construct_object, find_all
 from unrealsdk.hooks import Type, add_hook, remove_hook
 
 from .debug import dbg
@@ -66,6 +66,38 @@ NETCODE_WORDS = (
 )
 NETCODE_HOOK_WORDS = ("adjustposition", "setlocation", "moveautonomous")
 SERVERMOVE_FUNCS = ("Engine.PlayerController:ServerMove",)
+
+# The move-internals probe. UE3 carries per-move ability state in a SavedMove subclass and a byte of
+# CompressedFlags, and carries directional special moves in DoubleClickMove. None of that can be
+# subclassed from Python, but if the bits and the field are readable - and DoubleClickMove settable -
+# then the slide's start can ride the move stream instead of a side-channel message, which is what
+# gives it correct timing under replay. This dump decides whether that route is open.
+MOVE_WORDS = ("compressedflags", "savedmove", "doubleclick", "dodge", "acknowledgedmove")
+MOVE_PROP_WORDS = (
+    "savedmove",
+    "doubleclick",
+    "timestamp",
+    "pendingmove",
+    "currentmove",
+    "ackedmove",
+    "compressed",
+)
+INPUT_PROP_WORDS = ("double", "click", "duck", "sprint", "crouch")
+# The flag-layout decoder. A SavedMove carries both the individual booleans and the byte they are
+# packed into, so hooking the packer and logging the two side by side decodes the layout exactly -
+# and, just as importantly, shows which bits are never set by anything, which is where a slide flag
+# could live.
+SAVEDMOVE_ID = "SlidingDiscoverySavedMove"
+SAVEDMOVE_FUNCS = (
+    "WillowGame.WillowSavedMove:CompressedFlags",
+    "Engine.SavedMove:CompressedFlags",
+)
+SAVEDMOVE_BOOLS = ("bSprint", "bRun", "bDuck", "bPressedJump", "bDoubleJump")
+MAX_SAVEDMOVE_FIRES: int = 40
+
+MOVEFLAG_ID = "SlidingDiscoveryMoveFlags"
+MOVEFLAG_FUNCS = ("Engine.PlayerController:MoveAutonomous",)
+MAX_MOVEFLAG_FIRES: int = 40
 SERVERMOVE_ID = "SlidingDiscoveryServerMove"
 MAX_SERVERMOVE_FIRES: int = 40
 MAX_NETCODE_HOOKS: int = 12
@@ -106,6 +138,13 @@ class _Progress:
     transport_fires: ClassVar[int] = 0
     servermove_fires: ClassVar[int] = 0
     dumped_identity: ClassVar[bool] = False
+    dumped_move_internals: ClassVar[bool] = False
+    moveflag_fires: ClassVar[int] = 0
+    last_moveflag: ClassVar[str] = ""
+    savedmove_fires: ClassVar[int] = 0
+    last_savedmove: ClassVar[str] = ""
+    seen_flag_bits: ClassVar[int] = 0
+    probed_flag_layout: ClassVar[bool] = False
     last_fire_args: ClassVar[dict[str, str]] = {}
     dumped_surface_props: ClassVar[bool] = False
     hud_seen: ClassVar[set[str]] = set()
@@ -368,6 +407,259 @@ def _footstep_probe(
     note(f"FOOTSTEP #{count} {name} on={_short(obj)} args=({described})")
 
 
+def _props_matching(cls: Any, words: tuple[str, ...]) -> list[str]:
+    """Names of a class's properties whose name contains any of the given words."""
+    found: list[str] = []
+    try:
+        for prop in cls._properties():  # noqa: SLF001 - the only way to enumerate these
+            name = str(prop.Name)
+            if any(word in name.lower() for word in words):
+                found.append(name)
+    except Exception:  # noqa: BLE001
+        return found
+    return found
+
+
+def _dump_move_internals(pc: WillowPlayerController) -> None:
+    """Dump everything about how this build carries per-move state.
+
+    Three questions, all of which decide whether the slide can ride the move stream:
+      * does a SavedMove subclass exist, and what does it carry
+      * which CompressedFlags bit is which, so slide start can be read from the flags
+      * is DoubleClickMove - UE3's per-move directional special move channel - writable
+
+    A UE3 developer would subclass SavedMove and claim a spare flag bit. We cannot compile script,
+    so the question is what of that machinery is reachable read-only, and whether anything already
+    replicated can carry the signal for us.
+    """
+    if _Progress.dumped_move_internals:
+        return
+    _Progress.dumped_move_internals = True
+
+    try:
+        pc_class = pc.Class
+    except Exception as ex:  # noqa: BLE001
+        note(f"MOVE no controller class: {type(ex).__name__}: {ex}")
+        return
+    note(f"MOVE pc_class={_short(pc_class)}")
+
+    for name in _props_matching(pc_class, MOVE_PROP_WORDS):
+        try:
+            value = getattr(pc, name)
+        except Exception as ex:  # noqa: BLE001
+            value = f"<unreadable {type(ex).__name__}>"
+        note(f"MOVE   pc.{name} = {_short(value)}")
+
+    # The SavedMove class itself, and every field it carries.
+    saved_class: Any = None
+    try:
+        saved_class = pc.SavedMoveClass
+    except Exception as ex:  # noqa: BLE001
+        note(f"MOVE SavedMoveClass unreadable: {type(ex).__name__}: {ex}")
+    note(f"MOVE SavedMoveClass={_short(saved_class)}")
+    if saved_class is not None:
+        fields: list[str] = []
+        try:
+            fields = [str(prop.Name) for prop in saved_class._properties()]  # noqa: SLF001
+        except Exception as ex:  # noqa: BLE001
+            note(f"MOVE SavedMove fields unreadable: {type(ex).__name__}: {ex}")
+        note(f"MOVE SavedMove has {len(fields)} fields: {fields}")
+
+    # PlayerInput is where a double click direction would be authored, if anywhere.
+    player_input: Any = None
+    try:
+        player_input = pc.PlayerInput
+    except Exception as ex:  # noqa: BLE001
+        note(f"MOVE PlayerInput unreadable: {type(ex).__name__}: {ex}")
+    note(f"MOVE PlayerInput={_short(player_input)}")
+    if player_input is not None:
+        for name in _props_matching(player_input.Class, INPUT_PROP_WORDS):
+            try:
+                value = getattr(player_input, name)
+            except Exception as ex:  # noqa: BLE001
+                value = f"<unreadable {type(ex).__name__}>"
+            note(f"MOVE   input.{name} = {_short(value)}")
+
+        # Writability matters as much as existence: a field we can read but not set is no use as a
+        # channel. Written back with its own current value, so the probe changes nothing.
+        for name in _props_matching(player_input.Class, ("double",)):
+            try:
+                current = getattr(player_input, name)
+                setattr(player_input, name, current)
+            except Exception as ex:  # noqa: BLE001
+                note(f"MOVE   input.{name} NOT writable: {type(ex).__name__}: {ex}")
+            else:
+                note(f"MOVE   input.{name} writable")
+
+
+def _probe_flag_layout(pc: WillowPlayerController) -> None:
+    """Derive the CompressedFlags bit layout by asking the packer, instead of waiting to see it.
+
+    `CompressedFlags()` is only called from `ReplicateMove`, which only runs on a client - so
+    observing it needs a co-op session. But it is a pure function of the move's own booleans, so we
+    can build a SavedMove ourselves, flip one flag at a time, and read which bit moves. Same answer,
+    solo, deterministically, in one run.
+
+    The point of it is the free mask at the end: any bit no flag claims is a bit a slide marker can
+    occupy, which is what lets slide state ride the move stream rather than a side channel.
+    """
+    if _Progress.probed_flag_layout:
+        return
+    _Progress.probed_flag_layout = True
+
+    try:
+        saved_class = pc.SavedMoveClass
+        move = construct_object(saved_class, pc)
+    except Exception as ex:  # noqa: BLE001
+        note(f"FLAGBITS could not construct a SavedMove: {type(ex).__name__}: {ex}")
+        return
+    note(f"FLAGBITS probing {_short(saved_class)}")
+
+    def packed() -> int | None:
+        try:
+            return int(move.CompressedFlags())
+        except Exception as ex:  # noqa: BLE001
+            note(f"FLAGBITS CompressedFlags() failed: {type(ex).__name__}: {ex}")
+            return None
+
+    # Clear everything first, so the baseline is genuinely "no flags set".
+    for name in SAVEDMOVE_BOOLS:
+        try:
+            setattr(move, name, False)
+        except Exception:  # noqa: BLE001, S110 - absent on this class, nothing to clear
+            pass
+
+    if (base := packed()) is None:
+        return
+    note(f"FLAGBITS baseline=0b{base:08b} ({base})")
+
+    used = base
+    for name in SAVEDMOVE_BOOLS:
+        try:
+            setattr(move, name, True)
+        except Exception as ex:  # noqa: BLE001
+            note(f"FLAGBITS {name}: not settable ({type(ex).__name__})")
+            continue
+        value = packed()
+        try:
+            setattr(move, name, False)
+        except Exception:  # noqa: BLE001, S110 - restore is best effort
+            pass
+        if value is None:
+            continue
+        bit = value ^ base
+        used |= bit
+        note(f"FLAGBITS {name} -> bit 0b{bit:08b} ({bit})")
+
+    # DoubleClickMove is an enum rather than a bool, and may also fold into the byte.
+    for probe_value in (1, 2, 3, 4):
+        try:
+            move.DoubleClickMove = probe_value
+            value = packed()
+            move.DoubleClickMove = 0
+        except Exception:  # noqa: BLE001 - not present, or not settable
+            break
+        if value is not None and (bit := value ^ base):
+            used |= bit
+            note(f"FLAGBITS DoubleClickMove={probe_value} -> bit 0b{bit:08b} ({bit})")
+
+    free = (~used) & 0xFF
+    note(f"FLAGBITS used=0b{used:08b} free=0b{free:08b} ({free})")
+    if free:
+        lowest = free & -free
+        note(f"FLAGBITS lowest free bit = {lowest} (0b{lowest:08b}) - candidate slide marker")
+    else:
+        note("FLAGBITS no free bit in the byte - fall back to ForcedDoubleClick")
+
+
+def _savedmove_flags_probe(
+    obj: unreal.UObject,
+    _args: unreal.WrappedStruct,
+    ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """Decode the CompressedFlags bit layout from the move that packed it.
+
+    Post hook, so `ret` is the byte the game actually produced, while `obj` is the SavedMove holding
+    the booleans that went into it. Reading both off the same object removes the guesswork entirely -
+    no correlating across frames, no assuming stock UE3 bit order, which BL2 does not use.
+
+    The running OR of every byte seen is the useful by-product: any bit never set by anything the
+    game does is a bit a slide flag can occupy.
+    """
+    if _Progress.savedmove_fires >= MAX_SAVEDMOVE_FIRES:
+        return
+    try:
+        packed = int(ret)
+    except Exception:  # noqa: BLE001 - not the byte we expected
+        return
+
+    def flag(name: str) -> str:
+        try:
+            return "1" if getattr(obj, name) else "0"
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    bools = " ".join(f"{name[1:].lower()}={flag(name)}" for name in SAVEDMOVE_BOOLS)
+    try:
+        dclick = str(obj.DoubleClickMove)
+    except Exception:  # noqa: BLE001
+        dclick = "?"
+
+    key = f"{packed}|{bools}|{dclick}"
+    if key == _Progress.last_savedmove:
+        return
+    _Progress.last_savedmove = key
+    _Progress.savedmove_fires += 1
+    _Progress.seen_flag_bits |= packed
+    note(
+        f"SMOVE #{_Progress.savedmove_fires} packed={packed:>3} 0b{packed:08b} {bools}"
+        f" dclick={dclick} sliding={int(OWN_SLIDE_STATE.is_sliding)}"
+        f" everseen=0b{_Progress.seen_flag_bits:08b}",
+    )
+
+
+def _moveflags_probe(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """Decode the CompressedFlags bit layout by watching it change against known booleans.
+
+    Logged only when the combination changes, rather than every move. A bitfield is decoded from the
+    transitions, not from the volume of samples - and every move logged unchanged is a line not
+    spent on the one where a bit flipped.
+    """
+    if _Progress.moveflag_fires >= MAX_MOVEFLAG_FIRES:
+        return
+    try:
+        flags = int(args.CompressedFlags)
+        dclick = str(args.DoubleClickMove)
+    except Exception:  # noqa: BLE001 - variant without these args
+        return
+
+    def flag(name: str) -> str:
+        try:
+            return "1" if getattr(obj, name) else "0"
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    duck, run, jump = flag("bDuck"), flag("bRun"), flag("bPressedJump")
+    sprint = flag("bInSprintState")
+    sliding = "1" if OWN_SLIDE_STATE.is_sliding else "0"
+
+    key = f"{flags}|{dclick}|{duck}{run}{jump}{sprint}{sliding}"
+    if key == _Progress.last_moveflag:
+        return
+    _Progress.last_moveflag = key
+    _Progress.moveflag_fires += 1
+    note(
+        f"MFLAG #{_Progress.moveflag_fires} flags={flags:>3} 0b{flags:08b} dclick={dclick}"
+        f" duck={duck} run={run} jump={jump} sprint={sprint} sliding={sliding}",
+    )
+
+
 def _servermove_probe(
     obj: unreal.UObject,
     args: unreal.WrappedStruct,
@@ -536,6 +828,7 @@ def _scan_functions() -> None:
     footstep: list[str] = []
     postrender: list[str] = []
     netcode: list[str] = []
+    move: list[str] = []
     for func in functions:
         try:
             lowered = str(func.Name).lower()
@@ -547,6 +840,8 @@ def _scan_functions() -> None:
             bucket = postrender
         elif any(word in lowered for word in NETCODE_WORDS):
             bucket = netcode
+        elif any(word in lowered for word in MOVE_WORDS):
+            bucket = move
         else:
             continue
         if (hook_name := _hook_name(func)) is not None:
@@ -556,6 +851,7 @@ def _scan_functions() -> None:
         ("FOOTSTEP-CANDIDATE", footstep),
         ("POSTRENDER-CANDIDATE", postrender),
         ("NETCODE-CANDIDATE", netcode),
+        ("MOVE-CANDIDATE", move),
     ):
         for name in sorted(set(names)):
             note(f"SCAN {label} {name}")
@@ -647,6 +943,8 @@ def on_start(pc: WillowPlayerController) -> None:
     if not DISCOVERY:
         return
     _dump_network_identity(pc)
+    _dump_move_internals(pc)
+    _probe_flag_layout(pc)
     _scan_functions()
     _dump_animtree(pc)
     _dump_surface_props(pc)
@@ -667,6 +965,26 @@ def enable() -> None:
     _Progress.hud_seen = set()
     _Progress.fires = {}
     note("=== sliding discovery ===")
+
+    for name in SAVEDMOVE_FUNCS:
+        try:
+            added = add_hook(name, Type.POST, SAVEDMOVE_ID, _savedmove_flags_probe)
+        except Exception as ex:  # noqa: BLE001
+            note(f"SMOVE could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        if added:
+            _Progress.post_hooks.append(name)
+        note(f"SMOVE hook {name}: {'added' if added else 'refused'}")
+
+    for name in MOVEFLAG_FUNCS:
+        try:
+            added = add_hook(name, Type.PRE, MOVEFLAG_ID, _moveflags_probe)
+        except Exception as ex:  # noqa: BLE001
+            note(f"MFLAG could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        if added:
+            _Progress.pre_hooks.append(name)
+        note(f"MFLAG hook {name}: {'added' if added else 'refused'}")
 
     for name in SERVERMOVE_FUNCS:
         try:
@@ -704,7 +1022,7 @@ def enable() -> None:
 def disable() -> None:
     """Unhook everything this module registered, whenever and however it was registered."""
     for name in _Progress.post_hooks:
-        for identifier in (HUD_ID, SERVERMOVE_ID):
+        for identifier in (HUD_ID, SERVERMOVE_ID, SAVEDMOVE_ID):
             try:
                 remove_hook(name, Type.POST, identifier)
             except Exception:  # noqa: BLE001, S110 - nothing to do if it was never added
@@ -712,7 +1030,7 @@ def disable() -> None:
     for name in _Progress.pre_hooks:
         # One list holds both kinds, and removing an identifier that was never added is harmless, so
         # try both rather than tracking which probe claimed which name.
-        for identifier in (FOOTSTEP_ID, NETCODE_ID, TRANSPORT_ID):
+        for identifier in (FOOTSTEP_ID, NETCODE_ID, TRANSPORT_ID, MOVEFLAG_ID):
             try:
                 remove_hook(name, Type.PRE, identifier)
             except Exception:  # noqa: BLE001, S110

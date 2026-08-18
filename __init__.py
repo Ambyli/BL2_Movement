@@ -11,6 +11,7 @@ from mods_base import build_mod
 from networking import add_network_functions
 
 from . import discovery, events, viewmodel
+from .moveflags import disable_move_flags, enable_move_flags
 from .config import all_options
 from .hooks import (
     all_hooks,
@@ -35,11 +36,13 @@ events.slide_started.append(discovery.on_start)
 def _on_enable() -> None:
     enable_host_tick()
     enable_correction_suppression()
+    enable_move_flags()
     discovery.enable()
 
 
 def _on_disable() -> None:
     discovery.disable()
+    disable_move_flags()
     disable_correction_suppression()
     disable_host_tick()
 
