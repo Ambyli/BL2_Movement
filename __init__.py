@@ -12,7 +12,13 @@ from networking import add_network_functions
 
 from . import discovery, events, viewmodel
 from .config import all_options
-from .hooks import all_hooks, disable_host_tick, enable_host_tick
+from .hooks import (
+    all_hooks,
+    disable_correction_suppression,
+    disable_host_tick,
+    enable_correction_suppression,
+    enable_host_tick,
+)
 from .lifecycle import network_functions
 
 # Wiring. Presentation subscribes here rather than being called from the slide logic, so movement
@@ -28,11 +34,13 @@ events.slide_started.append(discovery.on_start)
 
 def _on_enable() -> None:
     enable_host_tick()
+    enable_correction_suppression()
     discovery.enable()
 
 
 def _on_disable() -> None:
     discovery.disable()
+    disable_correction_suppression()
     disable_host_tick()
 
 

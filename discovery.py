@@ -65,8 +65,11 @@ NETCODE_WORDS = (
     "autonomousphysics",
 )
 NETCODE_HOOK_WORDS = ("adjustposition", "setlocation", "moveautonomous")
+SERVERMOVE_FUNCS = ("Engine.PlayerController:ServerMove",)
+SERVERMOVE_ID = "SlidingDiscoveryServerMove"
+MAX_SERVERMOVE_FIRES: int = 40
 MAX_NETCODE_HOOKS: int = 12
-MAX_NETCODE_FIRES: int = 10
+MAX_NETCODE_FIRES: int = 25
 
 # The transport probe. The networking library moves every message over these two engine functions,
 # so watching them on both machines says exactly where a message stops: never sent, sent but not
@@ -101,6 +104,7 @@ class _Progress:
     fires: ClassVar[dict[str, int]] = {}
     netcode_fires: ClassVar[dict[str, int]] = {}
     transport_fires: ClassVar[int] = 0
+    servermove_fires: ClassVar[int] = 0
     dumped_identity: ClassVar[bool] = False
     last_fire_args: ClassVar[dict[str, str]] = {}
     dumped_surface_props: ClassVar[bool] = False
@@ -362,6 +366,41 @@ def _footstep_probe(
     count = _Progress.fires.get(name, 0) + 1
     _Progress.fires[name] = count
     note(f"FOOTSTEP #{count} {name} on={_short(obj)} args=({described})")
+
+
+def _servermove_probe(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """Measure the exact quantity the engine decides corrections on.
+
+    `ServerMove` carries the client's own claimed position; the server compares it against where its
+    simulation put that pawn, and corrects past a threshold. Every other probe here shows one side
+    or the other - this is the only one that shows the gap between them, which is what says whether
+    the jitter is a small constant offset, a drift that grows across the slide, or an oscillation.
+    """
+    if _Progress.servermove_fires >= MAX_SERVERMOVE_FIRES:
+        return
+    try:
+        pawn = obj.Pawn
+        if pawn is None:
+            return
+        here = pawn.Location
+        claimed = args.ClientLoc
+        dx, dy, dz = claimed.X - here.X, claimed.Y - here.Y, claimed.Z - here.Z
+        error = (dx * dx + dy * dy + dz * dz) ** 0.5
+    except Exception:  # noqa: BLE001 - shape differs between ServerMove variants
+        return
+    if error < 1.0:
+        return
+    _Progress.servermove_fires += 1
+    try:
+        who = str(obj.PlayerReplicationInfo.PlayerName)
+    except Exception:  # noqa: BLE001
+        who = "?"
+    note(f"SVMOVE #{_Progress.servermove_fires} {who} error={error:.1f} d=({dx:.1f},{dy:.1f},{dz:.1f})")
 
 
 def _transport_probe(
@@ -629,6 +668,16 @@ def enable() -> None:
     _Progress.fires = {}
     note("=== sliding discovery ===")
 
+    for name in SERVERMOVE_FUNCS:
+        try:
+            added = add_hook(name, Type.POST, SERVERMOVE_ID, _servermove_probe)
+        except Exception as ex:  # noqa: BLE001
+            note(f"SVMOVE could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        if added:
+            _Progress.post_hooks.append(name)
+        note(f"SVMOVE hook {name}: {'added' if added else 'refused'}")
+
     for name in TRANSPORT_FUNCS:
         try:
             added = add_hook(name, Type.PRE, TRANSPORT_ID, _transport_probe)
@@ -655,10 +704,11 @@ def enable() -> None:
 def disable() -> None:
     """Unhook everything this module registered, whenever and however it was registered."""
     for name in _Progress.post_hooks:
-        try:
-            remove_hook(name, Type.POST, HUD_ID)
-        except Exception:  # noqa: BLE001, S110 - nothing useful to do if it was never added
-            pass
+        for identifier in (HUD_ID, SERVERMOVE_ID):
+            try:
+                remove_hook(name, Type.POST, identifier)
+            except Exception:  # noqa: BLE001, S110 - nothing to do if it was never added
+                pass
     for name in _Progress.pre_hooks:
         # One list holds both kinds, and removing an identifier that was never added is harmless, so
         # try both rather than tracking which probe claimed which name.

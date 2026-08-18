@@ -14,6 +14,18 @@ LOG_PATH = Path.home() / "bl2_slide_debug.log"
 MAX_LINES: int = 4000
 
 _count: int = 0
+_suppressed: int = 0
+
+
+def note_suppressed() -> None:
+    """Count one dropped server correction."""
+    global _suppressed  # noqa: PLW0603 - module-level counter is the point
+    _suppressed += 1
+
+
+def suppressed_count() -> int:
+    """How many corrections have been dropped this session."""
+    return _suppressed
 
 
 def dbg(msg: str) -> None:

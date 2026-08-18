@@ -24,7 +24,7 @@ from unrealsdk import unreal
 
 from . import events
 from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT, start_speed
-from .debug import dbg
+from .debug import dbg, suppressed_count
 from .state import (
     CLIENTS_SLIDE_STATES,
     OWN_SLIDE_STATE,
@@ -39,11 +39,24 @@ if TYPE_CHECKING:
 
 @broadcast.json_message
 def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
+    """Carry a slide's momentum into the jump that ended it, on the machine that owns movement.
+
+    The client force-calls `DoJump` on its own pawn, because crouching swallows the ordinary jump
+    input and a slide holds crouch throughout. That call is purely local - it sets no replicated
+    flag - so without this the server never learns the player left the ground, keeps simulating them
+    walking, and corrects the jump away as fast as it is predicted. Hence the `DoJump` here too:
+    the server has to make the same move, not merely be told the resulting velocity.
+    """
     if is_client():
         return
     pc = cast("WillowPlayerController", server_set_slide_jump_velocity.sender.Owner)
-    pc.Pawn.Velocity.X = vel_x
-    pc.Pawn.Velocity.Y = vel_y
+    if (pawn := pc.Pawn) is None:
+        return
+    if pawn.IsOnGroundOrShortFall():
+        pawn.DoJump(True)
+    pawn.Velocity.X = vel_x
+    pawn.Velocity.Y = vel_y
+    dbg(f"SERVER_JUMP from={pc.PlayerReplicationInfo.PlayerName} vel=({vel_x:.0f},{vel_y:.0f})")
 
 
 @broadcast.message
@@ -105,7 +118,7 @@ def exit_slide(pc: WillowPlayerController) -> None:
         return
     OWN_SLIDE_STATE.is_sliding = False
     pc.Pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-    dbg(f"EXIT client={is_client()}")
+    dbg(f"EXIT client={is_client()} suppressed={suppressed_count()}")
     server_exit_slide()
     events.fire(events.slide_ended, pc)
 

@@ -8,7 +8,7 @@ or a slider change silently stops taking effect.
 
 from __future__ import annotations
 
-from mods_base import GroupedOption, SliderOption
+from mods_base import BoolOption, GroupedOption, SliderOption
 
 # Structural rather than feel dials, so they stay constants. SLIDE_SPEED_DEFAULT is where speed_pct
 # opens and the top of the decay range; CROUCHED_PCT_DEFAULT is both normal crouch speed and the
@@ -86,9 +86,35 @@ max_turn_degrees = SliderOption(
     ),
 )
 
+input_driven = BoolOption(
+    "Input Driven Slides",
+    True,
+    description=(
+        "Express a slide as movement input instead of forcing velocity onto the pawn. Unreal"
+        " replicates input and derives velocity from it, so writing velocity directly makes a slide"
+        " invisible to the server - which is what forced the host to re-simulate every remote slide"
+        " by hand, and what the position corrections were fighting. Writing input instead lets the"
+        " server see a slide as an ordinary move and reach the same answer on its own."
+        " Turn off to return to forced velocity, for comparison or if this misbehaves."
+    ),
+)
+
+smooth_coop_slides = BoolOption(
+    "Smooth Co-op Slides",
+    False,
+    description=(
+        "Ignore the server's position corrections for the length of your own slide, as a client."
+        " This was needed when the slide was forced onto the pawn, because the server simulated it"
+        " about a percent slower and corrected the difference around forty times a second. With"
+        " input driven slides both machines should agree on their own, so this defaults off - it is"
+        " kept as a fallback, and as a way to tell a remaining disagreement from a rendering one."
+    ),
+)
+
 all_options = [
     GroupedOption(
         "Sliding",
         (start_speed, decay_rate, max_duration, steer_rate, max_turn_degrees),
     ),
+    GroupedOption("Multiplayer", (input_driven, smooth_coop_slides)),
 ]
