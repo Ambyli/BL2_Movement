@@ -19,12 +19,23 @@ class _View:
 
 
 def on_start(pc: WillowPlayerController) -> None:
-    """Dip and roll the weapon into the slide pose."""
+    """Dip and roll the weapon into the slide pose.
+
+    Runs on: LOCAL MACHINE only (the one whose player is sliding). The Arms mesh is first-person
+    and lives only on the owning client; on other machines this pawn has no Arms attachment and
+    the early-return below catches that. Subscribed to `events.slide_started` in __init__.
+    """
+    # Kill any tween still running from an interrupted previous slide - a slide that ends before
+    # the pose animation finishes would otherwise leave overlapping tweens fighting each other.
     if _View.tweener.is_running():
         _View.tweener.kill()
+    # Third-person pawns have no Arms mesh; on those, this callback is a no-op. Only the owning
+    # client sees its own first-person arms.
     arms = pc.Pawn.Arms
     if not arms.Attachments:
         return
+    # Build a fresh parallel tween. Each tween_property call adds one channel; set_parallel(True)
+    # below makes them all animate concurrently rather than sequentially.
     _View.tweener = Tween()
     t = _View.tweener
     t.tween_property(
@@ -68,12 +79,19 @@ def on_start(pc: WillowPlayerController) -> None:
 
 
 def on_end(pc: WillowPlayerController) -> None:
-    """Return the weapon to its resting pose."""
+    """Return the weapon to its resting pose.
+
+    Runs on: LOCAL MACHINE only. Subscribed to `events.slide_ended` in __init__.
+    """
+    # Kill the slide-in tween if it's still running - we want to hand off cleanly to the
+    # settle-out animation rather than have both interpolators writing to the same channels.
     if _View.tweener.is_running():
         _View.tweener.kill()
+    # Same third-person guard as on_start: nothing to animate if this pawn has no Arms mesh.
     arms = pc.Pawn.Arms
     if not arms.Attachments:
         return
+    # New parallel tween, this time interpolating everything back to its resting pose.
     _View.tweener = Tween()
     t = _View.tweener
     t.tween_property(

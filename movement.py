@@ -47,6 +47,12 @@ def _who(pawn: WillowPlayerPawn) -> str:
 
 
 def can_slide(pc: WillowPlayerController, pawn: WillowPlayerPawn) -> bool:
+    """Whether the local player's slide should still be running this frame.
+
+    Runs on: whichever machine owns the slide (client or host). Read from handle_move as the
+    per-frame exit gate. Note that it checks OWN_SLIDE_STATE, not the shared dict - this only
+    speaks about the local player, never remote ones.
+    """
     return OWN_SLIDE_STATE.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
 
 
@@ -59,6 +65,11 @@ def slide(
 
     Owns nothing else: heading and velocity are applied in `apply_slide_physics`, from a post hook,
     where PlayerMove can no longer overwrite them.
+
+    Runs on: BOTH. Called from the client's `handle_move` (PRE PlayerMove) for its own slide, from
+    the host's `drive_hosted_slides` for the host's own slide entry, and from the host's
+    `_drive_remote_slide` (POST MoveAutonomous) for remote clients. The exit trigger fires a
+    targeted RPC back to whichever machine owns the slide.
     """
     # Height difference against last frame, in unreal units.
     z_diff: float = pc.Pawn.Location.Z - slide_data.old_z
@@ -75,10 +86,17 @@ def slide(
     # A slope may sustain a slide, but never push it past the speed it opened at.
     speed = min(speed, SLIDE_SPEED_DEFAULT)
 
+    # Persist the frame's result back into the state dataclass. `old_z` becomes the next frame's
+    # baseline for the slope calc, `speed_pct` feeds into apply_slide_physics's speed derivation,
+    # and `elapsed` is checked against the hard duration cap below.
     slide_data.old_z = pc.Pawn.Location.Z
     slide_data.speed_pct = speed
     slide_data.elapsed += delta_time
 
+    # Exit triggers: either the decay bled below the walking-crouch floor or the duration cap has
+    # hit. The RPC is `targeted`, so calling it from the host reaches the specific client that
+    # owns this slide; calling it from the client with its own PRI is a same-machine invocation
+    # that lands in `client_exit_slide` locally.
     if speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= max_duration.value:
         client_exit_slide(pc.PlayerReplicationInfo)
 
@@ -95,11 +113,20 @@ def apply_slide_physics(
     integrates. Acceleration is zeroed so the engine has nothing left to fight with, and the pawn's
     speed cap is held clear of the forced speed, or the cap clamps the slide back down the moment
     anything lowers GroundSpeed (aiming down sights being the obvious one).
+
+    Runs on: BOTH. Called from `enforce_slide` (POST PlayerMove) on the machine that owns the
+    local slide, and from `_drive_remote_slide` (POST MoveAutonomous) on the host for every
+    remote slide. Both are POST hooks by design - see the docstring on either caller.
     """
+    # Current slide heading, projected to the ground plane. If it's zero the entry heading was
+    # never locked (opened from a standstill) and there is nothing to force onto the pawn.
     direction = Vector((slide_data.dir_x, slide_data.dir_y, 0.0))
     if direction.magnitude == 0:
         return
 
+    # Read the pawn's current input as a candidate steering vector. Zero-magnitude input (no
+    # movement keys held) skips the steering branch entirely and the slide runs in a straight
+    # line at its current heading.
     accel = Vector(pawn.Acceleration)
     accel.z = 0
     if accel.magnitude > 0:
@@ -130,11 +157,18 @@ def apply_slide_physics(
                 sin_limit = math.sqrt(max(1.0 - cos_limit * cos_limit, 0.0))
                 direction = (entry * cos_limit + perp * sin_limit).normalize()
 
+    # Write the (possibly steered, possibly clamped) heading back into the state so the next
+    # frame's steering starts from where this one left off.
     slide_data.dir_x = direction.x
     slide_data.dir_y = direction.y
 
+    # Derive absolute speed from the decay curve's speed_pct. SLIDE_SPEED_DEFAULT is where the
+    # curve opens; dividing by it scales the raw tuning to whatever start_speed the user picked.
     speed = start_speed.value * (slide_data.speed_pct / SLIDE_SPEED_DEFAULT)
 
+    # Forcing the pawn state. CrouchedPct is held clear of the actual slide speed so the engine's
+    # cap (CrouchedPct * GroundSpeed) can't clamp us; Acceleration is zeroed so PhysWalking has
+    # nothing left to fight the velocity write with; Velocity carries the actual forced motion.
     pawn.CrouchedPct = max(SLIDE_SPEED_DEFAULT, (speed / max(pawn.GroundSpeed, 1.0)) * 2.0)
     pawn.Acceleration.X = 0.0
     pawn.Acceleration.Y = 0.0
@@ -167,12 +201,20 @@ def drive_hosted_slides(
     PlayerMove stops firing the moment the host jumps or gets in a vehicle, which would strand
     every other player's slide. The dedup matters because those hooks can both fire on the same
     frame, and running twice would decay every slide at double rate.
+
+    Runs on: HOST only. Callers are `handle_move` (PRE PlayerMove) and `_host_tick` (PRE
+    PlayerTick). Whichever fires first this frame wins; the other is a no-op via the world-time
+    dedup below.
     """
+    # World-time dedup. Both callers may fire on the same frame; the first to arrive stamps this
+    # frame's timestamp and does the work, and the second returns immediately.
     now = world_time()
     if now == _HostTick.last_world_time:
         return
     _HostTick.last_world_time = now
 
+    # Log the transition when the driver changes (usually PlayerTick after enable, occasionally
+    # PlayerMove when the tick hook failed to register). Steady-state produces no output.
     if _HostTick.reported_source != source:
         _HostTick.reported_source = source
         dbg(f"HOST TICK now driven by {source}")
@@ -190,12 +232,19 @@ def tick_hosted_slides(local_pc: WillowPlayerController, delta_time: float) -> N
 
     Our own entry is only decayed here, not forced: the local pawn is driven from the post hook
     instead, after PlayerMove has stopped overwriting it.
+
+    Runs on: HOST only. Called from `drive_hosted_slides` after the once-per-frame dedup. As of
+    the MoveAutonomous POST refactor, this only touches the host's OWN slide entry - remote
+    clients are decayed and forced from `_drive_remote_slide` on the client's move clock instead.
     """
+    # Walk the dict once, sweeping dead weak-refs as we go. Only our own entry is decayed here
+    # after the MoveAutonomous refactor; the rest of the dict is simulated on client move clocks.
     for player in CLIENTS_SLIDE_STATES.copy():
         if (_pc := player()) is None:
             CLIENTS_SLIDE_STATES.pop(player)
             continue
 
+        # An entry that's flagged not-sliding is a stale end-marker; we just leave it alone.
         state = CLIENTS_SLIDE_STATES[player]
         if not state.is_sliding:
             continue

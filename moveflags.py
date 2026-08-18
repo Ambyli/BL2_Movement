@@ -85,12 +85,17 @@ def _inject_slide_flag(
     _ret: Any,
     func: unreal.BoundFunction,
 ) -> tuple[type[Block], int] | None:
-    """Add our bit to the flags this move is about to send. Client side.
+    """Add our bit to the flags this move is about to send.
 
     The original is called rather than reimplemented, because the packing is Willow's and we have no
     business duplicating it - we only want to add to whatever it decided. `prevent_hooking_direct_calls`
     stops that inner call re-entering this hook.
+
+    Runs on: whichever machine is packing an outgoing SavedMove - normally a client sending to the
+    host. Fires on the host too when the host is a listen server building its own SavedMoves, but
+    there is no reader on that side, so the injected bit goes nowhere.
     """
+    # No slide, no bit - return None so the engine's own return value stands.
     if not OWN_SLIDE_STATE.is_sliding:
         return None
     try:
@@ -100,6 +105,8 @@ def _inject_slide_flag(
         dbg(f"FLAG INJECT FAILED {type(ex).__name__}: {ex}")
         return None
 
+    # Block the native return and substitute our OR'd value; the counter and one-shot log let us
+    # tell from the debug output whether the client half of the protocol is actually running.
     _Flags.injected += 1
     if not _Flags.reported_inject:
         _Flags.reported_inject = True
@@ -113,15 +120,19 @@ def _read_slide_flag(
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """Start or stop the host's copy of a slide from the flag on the move. Host side.
+    """Start or stop the host's copy of a slide from the flag on the move.
 
     Edge triggered: a slide begins on the first move carrying the bit and ends on the first move
     without it. That places both transitions on exactly the move the client made them on, which a
     queued message cannot do.
+
+    Runs on: HOST only. Fires as a PRE hook on MoveAutonomous every time an incoming ServerMove
+    from any client is applied.
     """
     if is_client():
         return
     try:
+        # Read the bit, and identify the player by their replication id (survives level loads).
         sliding = bool(int(args.CompressedFlags) & SLIDE_FLAG_BIT)
         pc = cast("WillowPlayerController", obj)
         player_id = int(pc.PlayerReplicationInfo.PlayerID)
@@ -132,11 +143,16 @@ def _read_slide_flag(
         _Flags.reported_read = True
         dbg("FLAG read live")
 
+    # Only act on edges. If the same bit state as last frame, nothing to do - most frames are
+    # steady-state and shouldn't churn the slide dict.
     was = _Flags.last_seen.get(player_id, False)
     if sliding == was:
         return
     _Flags.last_seen[player_id] = sliding
 
+    # Delegate to the shared start/end paths, tagged "flag" so debug can distinguish this route
+    # from the broadcast route. Both routes are idempotent, so whichever gets here first wins and
+    # the other becomes a no-op.
     try:
         if sliding:
             begin_server_slide(pc, "flag")
@@ -163,9 +179,14 @@ def _drive_remote_slide(
 
     A post hook puts our write after that physics, in the same relative position as the client's own
     post hook - which is what gives the two simulations a chance to track each other.
+
+    Runs on: HOST only. POST hook on MoveAutonomous, so it fires once per incoming client move,
+    after the engine's walking integration but before the position-comparison inside ServerMove.
     """
     if is_client():
         return
+    # Field access on WrappedStruct can throw if the property layout doesn't match this build.
+    # Wrap the whole read block so a bad struct is a skipped frame, not a broken move path.
     try:
         pc = cast("WillowPlayerController", obj)
         pawn = pc.Pawn
@@ -177,6 +198,9 @@ def _drive_remote_slide(
     if delta_time <= 0.0:
         return
 
+    # This hook fires for every MoveAutonomous call, one per client per move. Walk the dict looking
+    # for the entry keyed by *this* controller; any other slide's decay is handled by that player's
+    # own MoveAutonomous when it fires, not here.
     for player in CLIENTS_SLIDE_STATES.copy():
         if (_pc := player()) is None:
             CLIENTS_SLIDE_STATES.pop(player)
@@ -184,6 +208,9 @@ def _drive_remote_slide(
         if _pc != pc:
             continue
         state = CLIENTS_SLIDE_STATES[player]
+        # Entry exists but the slide has already ended - the read-flag hook cleared it on the
+        # last move without the bit. Nothing more to do until the flag comes back or the entry
+        # is repopulated by another begin_server_slide.
         if not state.is_sliding:
             return
         try:
@@ -215,7 +242,11 @@ def _claimed_location(args: unreal.WrappedStruct, variant: str) -> Any:
     several ServerMove variants and they do not agree on what the field is called - guessing wrong
     returns None, which is indistinguishable from "this player is not sliding", and cost a full test
     cycle exactly that way. The resolved name is cached per variant and logged once.
+
+    Runs on: HOST only. Called from _trust_client_position on every ServerMove PRE fire.
     """
+    # Cache hit for a variant we have already introspected. `None` cached means "no position field
+    # on this variant" - we recorded that too, to avoid rescanning every packet.
     if variant in _ArgName.resolved:
         name = _ArgName.resolved[variant]
         if name is None:
@@ -225,6 +256,10 @@ def _claimed_location(args: unreal.WrappedStruct, variant: str) -> Any:
         except Exception:  # noqa: BLE001
             return None
 
+    # First time seeing this variant: enumerate its properties and find the one that looks like a
+    # position field. Heuristic is name contains "loc" but not "rot", and the value has X/Y/Z.
+    # `names` is captured for the one-time log line below - if the heuristic fails, the log tells
+    # us the actual field names so the check can be updated.
     found: str | None = None
     names: list[str] = []
     try:
@@ -245,6 +280,7 @@ def _claimed_location(args: unreal.WrappedStruct, variant: str) -> Any:
     except Exception as ex:  # noqa: BLE001
         dbg(f"TRUST arg scan failed on {variant}: {type(ex).__name__}: {ex}")
 
+    # Cache the result (including `None`) and log once. Next call for this variant is a hit.
     _ArgName.resolved[variant] = found
     dbg(f"TRUST {variant} position arg={found} (args: {names})")
     if found is None:
@@ -284,7 +320,12 @@ def _trust_client_position(
     post hook adopted the position faithfully and still left the correction already on the wire,
     which measured as a 303 unit gap being closed one step after it had been acted on. Adopting
     first means the comparison the server makes is against a position it already agrees with.
+
+    Runs on: HOST only. PRE hook on every ServerMove variant, so this fires before the engine
+    integrates the incoming move at all.
     """
+    # Feature switch and client short-circuit. This hook is registered globally but only does
+    # work when adoption is enabled and we're on the host.
     if is_client() or not trust_client_slides.value:
         return
     try:
@@ -295,6 +336,9 @@ def _trust_client_position(
     except Exception:  # noqa: BLE001
         return
 
+    # Walk the slide dict looking for this controller. `matched` is checked at the bottom of the
+    # function so a "not found" case can be logged distinctly from the "found but not sliding"
+    # case; both used to be silent, and that silence hid real bugs.
     matched = False
     for player in CLIENTS_SLIDE_STATES.copy():
         if (_pc := player()) is None:
@@ -304,13 +348,20 @@ def _trust_client_position(
             continue
         matched = True
 
+        # Which ServerMove variant fired this hook - used to look up the position field name on
+        # `args`. Best effort; if the variant name can't be read we still try _claimed_location
+        # with "?" and let it hit the same cache slot for the anonymous case.
         try:
             variant = str(_func.func.Name)
         except Exception:  # noqa: BLE001
             variant = "?"
+        # If we can't find a position field on this variant, there is nothing to adopt. The
+        # cache inside _claimed_location will remember the miss.
         if (claimed := _claimed_location(args, variant)) is None:
             return
         try:
+            # Measure the drift for diagnostics before overwriting. `gap` becomes the per-slide
+            # "worst_gap" high-water mark that shows up in the EXIT log line.
             here = pawn.Location
             gap = (
                 (claimed.X - here.X) ** 2 + (claimed.Y - here.Y) ** 2 + (claimed.Z - here.Z) ** 2
@@ -320,6 +371,9 @@ def _trust_client_position(
             dbg(f"TRUST FAILED {type(ex).__name__}: {ex}")
             return
 
+        # Record the adoption in the per-slide accumulators (worst_gap etc), and log the very
+        # first success so we can tell from the debug output whether the trust path is actually
+        # engaging - a session that shows no TRUST line has one of the deeper problems.
         note_adopted(gap)
         if not _Trust.reported:
             _Trust.reported = True
@@ -351,6 +405,14 @@ def _trust_client_position(
 
 
 def enable_move_flags() -> None:
+    """Wire all four move-flag hooks: inject, read, drive, trust. Runs on: BOTH, at mod-enable.
+
+    Some of these are client-side by nature (inject) and some host-side (read, drive, trust); they
+    all get registered on both machines and the individual functions' client/host guards decide
+    when to actually do work.
+    """
+    # Inject hooks: PRE CompressedFlags on both the Willow-specific and generic SavedMove classes.
+    # BL2 uses one or the other depending on subclassing; try both, expect one to raise.
     for name in INJECT_FUNCS:
         try:
             added = add_hook(name, Type.PRE, INJECT_ID, _inject_slide_flag)
@@ -359,6 +421,7 @@ def enable_move_flags() -> None:
             continue
         dbg(f"FLAG inject hook on {name}: {'added' if added else 'refused'}")
 
+    # Read hook: PRE MoveAutonomous on the host, edge-triggers begin/end_server_slide.
     for name in READ_FUNCS:
         try:
             added = add_hook(name, Type.PRE, READ_ID, _read_slide_flag)
@@ -367,6 +430,8 @@ def enable_move_flags() -> None:
             continue
         dbg(f"FLAG read hook on {name}: {'added' if added else 'refused'}")
 
+    # Drive hook: POST MoveAutonomous on the host, forces velocity after walking-physics has run.
+    # POST specifically because CalcVelocity would clobber a PRE write - see the function docstring.
     for name in DRIVE_FUNCS:
         try:
             added = add_hook(name, Type.POST, DRIVE_ID, _drive_remote_slide)
@@ -375,6 +440,9 @@ def enable_move_flags() -> None:
             continue
         dbg(f"FLAG drive hook on {name}: {'added' if added else 'refused'}")
 
+    # Trust hooks: PRE on three ServerMove variants. BL2 routes short/normal moves through
+    # different functions, and we need to catch all of them - a missed variant means adoption
+    # never fires for slides delivered through it.
     for name in TRUST_FUNCS:
         try:
             added = add_hook(name, Type.PRE, TRUST_ID, _trust_client_position)
@@ -385,6 +453,9 @@ def enable_move_flags() -> None:
 
 
 def disable_move_flags() -> None:
+    """Unwire the four move-flag hooks and clear per-player state. Runs on: BOTH, at mod-disable."""
+    # Symmetric with enable_move_flags: remove every hook that might have been registered. A
+    # missing hook is expected (the enable loop may have failed on the same variant), not fatal.
     for name in INJECT_FUNCS:
         try:
             remove_hook(name, Type.PRE, INJECT_ID)
@@ -405,6 +476,8 @@ def disable_move_flags() -> None:
             remove_hook(name, Type.PRE, TRUST_ID)
         except Exception:  # noqa: BLE001, S110
             pass
+    # Clear the per-player "were they sliding last frame" cache so a subsequent enable starts
+    # from a clean slate; a stale True here would suppress the first begin_server_slide.
     _Flags.last_seen.clear()
 
 
