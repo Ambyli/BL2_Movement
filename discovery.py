@@ -968,7 +968,9 @@ def enable() -> None:
 
     for name in SAVEDMOVE_FUNCS:
         try:
-            added = add_hook(name, Type.POST, SAVEDMOVE_ID, _savedmove_flags_probe)
+            # Unconditional: the flag injector blocks this function on sliding moves, and a
+            # plain POST hook would therefore only ever see the moves we did not touch.
+            added = add_hook(name, Type.POST_UNCONDITIONAL, SAVEDMOVE_ID, _savedmove_flags_probe)
         except Exception as ex:  # noqa: BLE001
             note(f"SMOVE could not hook {name}: {type(ex).__name__}: {ex}")
             continue
@@ -1022,7 +1024,7 @@ def enable() -> None:
 def disable() -> None:
     """Unhook everything this module registered, whenever and however it was registered."""
     for name in _Progress.post_hooks:
-        for identifier in (HUD_ID, SERVERMOVE_ID, SAVEDMOVE_ID):
+        for identifier in (HUD_ID, SERVERMOVE_ID):
             try:
                 remove_hook(name, Type.POST, identifier)
             except Exception:  # noqa: BLE001, S110 - nothing to do if it was never added
@@ -1035,6 +1037,11 @@ def disable() -> None:
                 remove_hook(name, Type.PRE, identifier)
             except Exception:  # noqa: BLE001, S110
                 pass
+    for name in SAVEDMOVE_FUNCS:
+        try:
+            remove_hook(name, Type.POST_UNCONDITIONAL, SAVEDMOVE_ID)
+        except Exception:  # noqa: BLE001, S110
+            pass
     _Progress.post_hooks.clear()
     _Progress.pre_hooks.clear()
     _Progress.scanned_functions = False

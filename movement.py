@@ -200,18 +200,18 @@ def tick_hosted_slides(local_pc: WillowPlayerController, delta_time: float) -> N
         if not state.is_sliding:
             continue
 
-        slide(_pc, state, delta_time)
+        # Remote players are no longer driven from here. A remote pawn does not move on the host's
+        # frame at all - it moves inside MoveAutonomous, at packet rate - so both their decay and
+        # their forced velocity now live in the post hook on that function, where the writes land
+        # after the physics instead of being recomputed by it. This loop keeps only our own entry.
+        if _pc != local_pc:
+            continue
 
-        if _pc == local_pc:
-            # Mirror our own progress out, so the local exit checks still see it when we are the
-            # host and our state lives in this dict rather than in OWN_SLIDE_STATE.
-            OWN_SLIDE_STATE.speed_pct = state.speed_pct
-            OWN_SLIDE_STATE.elapsed = state.elapsed
-        elif _pc.Pawn is not None:
-            try:
-                apply_slide_physics(cast("WillowPlayerPawn", _pc.Pawn), state, delta_time)
-            except Exception as ex:  # noqa: BLE001 - one bad pawn must not stall the others
-                dbg(f"REMOTE SLIDE FAILED {type(ex).__name__}: {ex}")
+        slide(_pc, state, delta_time)
+        # Mirror our own progress out, so the local exit checks still see it when we are the host
+        # and our state lives in this dict rather than in OWN_SLIDE_STATE.
+        OWN_SLIDE_STATE.speed_pct = state.speed_pct
+        OWN_SLIDE_STATE.elapsed = state.elapsed
 
 
 __all__ = [

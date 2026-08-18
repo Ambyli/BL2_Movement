@@ -24,8 +24,14 @@ def note_suppressed() -> None:
 
 
 def suppressed_count() -> int:
-    """How many corrections have been dropped this session."""
+    """How many corrections have been dropped since the count was last reset."""
     return _suppressed
+
+
+def reset_suppressed() -> None:
+    """Zero the count, so each slide reports its own figure rather than a running total."""
+    global _suppressed  # noqa: PLW0603 - module-level counter is the point
+    _suppressed = 0
 
 
 def dbg(msg: str) -> None:

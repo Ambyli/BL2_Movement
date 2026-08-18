@@ -57,25 +57,6 @@ def world_time() -> float:
     return float(cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().TimeSeconds)
 
 
-def set_slide_heading(slide_data: PlayerSlideState, dir_x: float, dir_y: float) -> bool:
-    """Point a slide along an explicitly given heading, leaving its decay untouched.
-
-    Used for the heading the *client* reports. The host cannot work this out for itself: it derives
-    a heading from the pawn's velocity, but it is also the thing writing that velocity, so once a
-    slide is running it only ever re-reads its own guess. The client is the only party that knows
-    which way the player actually set off.
-    """
-    heading = Vector((dir_x, dir_y, 0.0))
-    if heading.magnitude < 0.01:
-        return False
-    heading.normalize()
-    slide_data.dir_x = heading.x
-    slide_data.dir_y = heading.y
-    slide_data.entry_x = heading.x
-    slide_data.entry_y = heading.y
-    return True
-
-
 def begin_slide_state(pawn: WillowPlayerPawn, slide_data: PlayerSlideState) -> None:
     """Lock in the heading a slide was entered at."""
     slide_data.speed_pct = SLIDE_SPEED_DEFAULT

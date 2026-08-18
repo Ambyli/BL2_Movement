@@ -198,9 +198,6 @@ def _suppress_correction(
 
 
 def enable_correction_suppression() -> None:
-    # Logged because "suppressed=0" is ambiguous otherwise: it reads the same whether nothing needed
-    # suppressing or the option is off on this machine. Each player has their own settings file.
-    dbg(f"SUPPRESS option smooth_coop_slides={smooth_coop_slides.value}")
     for name in CORRECTION_FUNCS:
         try:
             added = add_hook(name, Type.PRE, CORRECTION_ID, _suppress_correction)

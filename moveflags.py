@@ -35,7 +35,8 @@ from unrealsdk.hooks import Block, Type, add_hook, prevent_hooking_direct_calls,
 
 from .debug import dbg
 from .lifecycle import begin_server_slide, end_server_slide
-from .state import OWN_SLIDE_STATE, is_client, world_time
+from .movement import apply_slide_physics, slide
+from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, is_client
 
 if TYPE_CHECKING:
     from unrealsdk import unreal
@@ -45,16 +46,6 @@ if TYPE_CHECKING:
 SLIDE_FLAG_BIT: int = 0x80
 """The one bit nothing else claims. See the layout in the module docstring."""
 
-FLAG_STOP_GRACE: float = 0.25
-"""How long the bit must be absent before the host calls the slide over, in seconds.
-
-Not zero, because absence of the bit on a single move does not mean the slide ended. UE3 sends more
-than the newest move - `DualServerMove` and `OldServerMove` carry earlier ones, and those legitimately
-predate the slide. Treating each of those as a stop made the host end and restart the slide many
-times a second, and every restart re-derived the heading from the velocity the host itself was
-forcing, which is what pinned every client slide to one direction.
-"""
-
 INJECT_ID = "SlidingFlagInject"
 READ_ID = "SlidingFlagRead"
 
@@ -63,6 +54,8 @@ INJECT_FUNCS = (
     "Engine.SavedMove:CompressedFlags",
 )
 READ_FUNCS = ("Engine.PlayerController:MoveAutonomous",)
+DRIVE_ID = "SlidingFlagDrive"
+DRIVE_FUNCS = ("Engine.PlayerController:MoveAutonomous",)
 
 
 class _Flags:
@@ -73,7 +66,6 @@ class _Flags:
     """
 
     last_seen: ClassVar[dict[int, bool]] = {}
-    last_bit_at: ClassVar[dict[int, float]] = {}
     injected: ClassVar[int] = 0
     reported_inject: ClassVar[bool] = False
     reported_read: ClassVar[bool] = False
@@ -115,10 +107,9 @@ def _read_slide_flag(
 ) -> None:
     """Start or stop the host's copy of a slide from the flag on the move. Host side.
 
-    A slide begins on the first move carrying the bit - on exactly the move the client started it,
-    which a queued message cannot manage. Ending is deliberately not symmetric: it waits for the bit
-    to stay absent, because a single move without it usually means an older move arrived late rather
-    than that the slide is over. See FLAG_STOP_GRACE.
+    Edge triggered: a slide begins on the first move carrying the bit and ends on the first move
+    without it. That places both transitions on exactly the move the client made them on, which a
+    queued message cannot do.
     """
     if is_client():
         return
@@ -133,30 +124,69 @@ def _read_slide_flag(
         _Flags.reported_read = True
         dbg("FLAG read live")
 
-    now = world_time()
     was = _Flags.last_seen.get(player_id, False)
+    if sliding == was:
+        return
+    _Flags.last_seen[player_id] = sliding
 
-    if sliding:
-        _Flags.last_bit_at[player_id] = now
-        if was:
-            return
-        _Flags.last_seen[player_id] = True
-        try:
-            begin_server_slide(pc, "flag")
-        except Exception as ex:  # noqa: BLE001 - must never break the move path
-            dbg(f"FLAG EDGE FAILED {type(ex).__name__}: {ex}")
-        return
-
-    if not was:
-        return
-    # Bit missing. Only believe it once the bit has stayed missing for a while - see FLAG_STOP_GRACE.
-    if now - _Flags.last_bit_at.get(player_id, 0.0) < FLAG_STOP_GRACE:
-        return
-    _Flags.last_seen[player_id] = False
     try:
-        end_server_slide(pc, "flag")
-    except Exception as ex:  # noqa: BLE001
+        if sliding:
+            begin_server_slide(pc, "flag")
+        else:
+            end_server_slide(pc, "flag")
+    except Exception as ex:  # noqa: BLE001 - must never break the move path
         dbg(f"FLAG EDGE FAILED {type(ex).__name__}: {ex}")
+
+
+def _drive_remote_slide(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """Force a remote player's slide velocity where the server actually integrates their movement.
+
+    This is the server-side twin of `enforce_slide`, and it exists for the identical reason. The host
+    was driving remote pawns from `PlayerTick`, but a remote pawn does not move on the host's frame -
+    it moves inside `MoveAutonomous`, which runs at packet rate and calls `AutonomousPhysics` ->
+    `PhysWalking` -> `CalcVelocity`. `CalcVelocity` recomputes velocity from acceleration before
+    integrating, so anything written on the host's tick was overwritten before it was ever used, and
+    the server simulated the player as walking no matter what it had been told about the slide.
+
+    A post hook puts our write after that physics, in the same relative position as the client's own
+    post hook - which is what gives the two simulations a chance to track each other.
+    """
+    if is_client():
+        return
+    try:
+        pc = cast("WillowPlayerController", obj)
+        pawn = pc.Pawn
+        if pawn is None:
+            return
+        delta_time = float(args.DeltaTime)
+    except Exception:  # noqa: BLE001
+        return
+    if delta_time <= 0.0:
+        return
+
+    for player in CLIENTS_SLIDE_STATES.copy():
+        if (_pc := player()) is None:
+            CLIENTS_SLIDE_STATES.pop(player)
+            continue
+        if _pc != pc:
+            continue
+        state = CLIENTS_SLIDE_STATES[player]
+        if not state.is_sliding:
+            return
+        try:
+            # Decay here too, not on the host's tick. There is one MoveAutonomous per client frame,
+            # so decaying on this clock advances the server's copy in step with the client's own
+            # frames rather than with the host's - which is a different frame rate entirely.
+            slide(pc, state, delta_time)
+            apply_slide_physics(pawn, state, delta_time)
+        except Exception as ex:  # noqa: BLE001 - must never break the move path
+            dbg(f"FLAG DRIVE FAILED {type(ex).__name__}: {ex}")
+        return
 
 
 def enable_move_flags() -> None:
@@ -176,6 +206,14 @@ def enable_move_flags() -> None:
             continue
         dbg(f"FLAG read hook on {name}: {'added' if added else 'refused'}")
 
+    for name in DRIVE_FUNCS:
+        try:
+            added = add_hook(name, Type.POST, DRIVE_ID, _drive_remote_slide)
+        except Exception as ex:  # noqa: BLE001
+            dbg(f"FLAG could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        dbg(f"FLAG drive hook on {name}: {'added' if added else 'refused'}")
+
 
 def disable_move_flags() -> None:
     for name in INJECT_FUNCS:
@@ -188,8 +226,12 @@ def disable_move_flags() -> None:
             remove_hook(name, Type.PRE, READ_ID)
         except Exception:  # noqa: BLE001, S110
             pass
+    for name in DRIVE_FUNCS:
+        try:
+            remove_hook(name, Type.POST, DRIVE_ID)
+        except Exception:  # noqa: BLE001, S110
+            pass
     _Flags.last_seen.clear()
-    _Flags.last_bit_at.clear()
 
 
 def injected_count() -> int:
