@@ -86,28 +86,16 @@ max_turn_degrees = SliderOption(
     ),
 )
 
-input_driven = BoolOption(
-    "Input Driven Slides",
-    True,
-    description=(
-        "Express a slide as movement input instead of forcing velocity onto the pawn. Unreal"
-        " replicates input and derives velocity from it, so writing velocity directly makes a slide"
-        " invisible to the server - which is what forced the host to re-simulate every remote slide"
-        " by hand, and what the position corrections were fighting. Writing input instead lets the"
-        " server see a slide as an ordinary move and reach the same answer on its own."
-        " Turn off to return to forced velocity, for comparison or if this misbehaves."
-    ),
-)
-
 smooth_coop_slides = BoolOption(
     "Smooth Co-op Slides",
-    False,
+    True,
     description=(
-        "Ignore the server's position corrections for the length of your own slide, as a client."
-        " This was needed when the slide was forced onto the pawn, because the server simulated it"
-        " about a percent slower and corrected the difference around forty times a second. With"
-        " input driven slides both machines should agree on their own, so this defaults off - it is"
-        " kept as a fallback, and as a way to tell a remaining disagreement from a rendering one."
+        "Ignore the server's position corrections for the length of a slide, when you are the one"
+        " sliding as a client. The server simulates a slide about a percent slower than you"
+        " predict it, and corrects the difference around forty times a second, which is felt as"
+        " constant micro-stutter. Suppressing that for the ~1.5s of a slide trades it for one"
+        " correction at the end. Turn off to compare, or if you ever see yourself finish a slide"
+        " somewhere you did not expect."
     ),
 )
 
@@ -116,5 +104,5 @@ all_options = [
         "Sliding",
         (start_speed, decay_rate, max_duration, steer_rate, max_turn_degrees),
     ),
-    GroupedOption("Multiplayer", (input_driven, smooth_coop_slides)),
+    GroupedOption("Multiplayer", (smooth_coop_slides,)),
 ]

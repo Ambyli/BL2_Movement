@@ -2,23 +2,17 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from mods_base import hook
 from uemath import Vector
 from unrealsdk import unreal
 from unrealsdk.hooks import Block, Type, add_hook, remove_hook
 
-from .config import CROUCHED_PCT_DEFAULT, input_driven, max_duration, smooth_coop_slides
+from .config import CROUCHED_PCT_DEFAULT, max_duration, smooth_coop_slides
 from .debug import dbg, note_suppressed
 from .lifecycle import enter_slide, exit_slide, server_set_slide_jump_velocity
-from .movement import (
-    apply_slide_input,
-    apply_slide_physics,
-    can_slide,
-    drive_hosted_slides,
-    slide,
-)
+from .movement import apply_slide_physics, can_slide, drive_hosted_slides, slide
 from .state import OWN_SLIDE_STATE, State, is_client
 
 if TYPE_CHECKING:
@@ -39,17 +33,6 @@ def jump(
         vel.z = 0
         State.horizontal_velocity = vel
         State.do_slide_jump = True
-
-
-class _InputDrive:
-    """Whether the input driven model managed to drive the current frame.
-
-    Read by the post hook, which takes over for exactly the frames the pre hook could not handle.
-    `reported` keeps the fallback from writing a line every frame once it starts failing.
-    """
-
-    failed_this_frame: ClassVar[bool] = False
-    reported: ClassVar[bool] = False
 
 
 @hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove")
@@ -91,26 +74,6 @@ def handle_move(
         or OWN_SLIDE_STATE.elapsed >= max_duration.value
     ):
         exit_slide(pc)
-        return
-
-    # Drive our own slide here, before PlayerMove runs, so the input we write is the input this
-    # frame reads and sends. The legacy model cannot use this spot - it writes velocity, which
-    # PlayerMove would recompute moments later - so it stays in the post hook below.
-    _InputDrive.failed_this_frame = False
-    if input_driven.value:
-        try:
-            driven = apply_slide_input(pc, pawn, OWN_SLIDE_STATE, args.DeltaTime)
-        except Exception as ex:  # noqa: BLE001 - a drive failure must not wedge movement
-            dbg(f"PRE FAILED {type(ex).__name__}: {ex}")
-            driven = False
-        if not driven:
-            # Genuinely hand this frame to the legacy path rather than leaving the slide undriven.
-            # If the engine will not give us its view axes we cannot express a heading as input, and
-            # a slide that silently stops being driven is far worse than one that stops replicating.
-            _InputDrive.failed_this_frame = True
-            if not _InputDrive.reported:
-                _InputDrive.reported = True
-                dbg("INPUT DRIVE unavailable - forcing velocity instead. Check for AXES FAILED.")
 
 
 @hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove", Type.POST)
@@ -120,14 +83,8 @@ def enforce_slide(
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """Reassert the slide once PlayerMove has finished recomputing movement from input.
-
-    Legacy model only. The input driven model has already written its slide before PlayerMove ran,
-    and forcing velocity on top of it here would undo the very thing that makes it replicate.
-    """
+    """Reassert the slide once PlayerMove has finished recomputing movement from input."""
     if not OWN_SLIDE_STATE.is_sliding:
-        return
-    if input_driven.value and not _InputDrive.failed_this_frame:
         return
     pc = cast("WillowPlayerController", obj)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
