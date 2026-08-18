@@ -99,10 +99,24 @@ smooth_coop_slides = BoolOption(
     ),
 )
 
+trust_client_slides = BoolOption(
+    "Trust Client Slides",
+    True,
+    description=(
+        "While a client is sliding, the host adopts the position that client reports instead of"
+        " simulating the slide itself. Two independent simulations with different clocks drift"
+        " apart no matter how closely their inputs are matched - measured at over 500 units by the"
+        " end of a single slide - and the snap you feel at the end is that gap being closed all at"
+        " once. Adopting the client's own position removes the gap by construction. This trusts the"
+        " sliding player for the ~1.5s of a slide, which is a fair trade in co-op against friends"
+        " and would not be in a competitive game."
+    ),
+)
+
 all_options = [
     GroupedOption(
         "Sliding",
         (start_speed, decay_rate, max_duration, steer_rate, max_turn_degrees),
     ),
-    GroupedOption("Multiplayer", (smooth_coop_slides,)),
+    GroupedOption("Multiplayer", (smooth_coop_slides, trust_client_slides)),
 ]

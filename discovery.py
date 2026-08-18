@@ -65,7 +65,16 @@ NETCODE_WORDS = (
     "autonomousphysics",
 )
 NETCODE_HOOK_WORDS = ("adjustposition", "setlocation", "moveautonomous")
-SERVERMOVE_FUNCS = ("Engine.PlayerController:ServerMove",)
+# Every variant the scan turned up. Hooking only the base one produced zero samples across a whole
+# co-op session - BL2 routes through one of the others, and a hook on a name that is never called
+# looks exactly like a function that never disagrees.
+SERVERMOVE_FUNCS = (
+    "Engine.PlayerController:ServerMove",
+    "Engine.PlayerController:PCServerMoveInner",
+    "Engine.PlayerController:DualServerMove",
+    "Engine.PlayerController:OldServerMove",
+    "WillowGame.WillowPlayerController:ShortServerMove",
+)
 
 # The move-internals probe. UE3 carries per-move ability state in a SavedMove subclass and a byte of
 # CompressedFlags, and carries directional special moves in DoubleClickMove. None of that can be
@@ -680,7 +689,15 @@ def _servermove_probe(
         if pawn is None:
             return
         here = pawn.Location
-        claimed = args.ClientLoc
+        claimed = None
+        for field in ("ClientLoc", "ClientLocation", "InClientLoc"):
+            try:
+                claimed = getattr(args, field)
+            except Exception:  # noqa: BLE001 - variant without this name
+                continue
+            break
+        if claimed is None:
+            return
         dx, dy, dz = claimed.X - here.X, claimed.Y - here.Y, claimed.Z - here.Z
         error = (dx * dx + dy * dy + dz * dz) ** 0.5
     except Exception:  # noqa: BLE001 - shape differs between ServerMove variants

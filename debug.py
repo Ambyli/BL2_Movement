@@ -28,10 +28,28 @@ def suppressed_count() -> int:
     return _suppressed
 
 
+_adopted: int = 0
+_worst_gap: float = 0.0
+
+
+def note_adopted(gap: float) -> None:
+    """Count one position adopted from a client, and remember the largest gap closed."""
+    global _adopted, _worst_gap  # noqa: PLW0603 - module-level counters are the point
+    _adopted += 1
+    _worst_gap = max(_worst_gap, gap)
+
+
+def adopted_stats() -> tuple[int, float]:
+    """Positions adopted and the worst gap, since the last reset."""
+    return _adopted, _worst_gap
+
+
 def reset_suppressed() -> None:
     """Zero the count, so each slide reports its own figure rather than a running total."""
-    global _suppressed  # noqa: PLW0603 - module-level counter is the point
+    global _suppressed, _adopted, _worst_gap  # noqa: PLW0603 - module-level counters
     _suppressed = 0
+    _adopted = 0
+    _worst_gap = 0.0
 
 
 def dbg(msg: str) -> None:

@@ -24,7 +24,7 @@ from unrealsdk import unreal
 
 from . import events
 from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT, start_speed
-from .debug import dbg, reset_suppressed, suppressed_count
+from .debug import adopted_stats, dbg, reset_suppressed, suppressed_count
 from .state import (
     CLIENTS_SLIDE_STATES,
     OWN_SLIDE_STATE,
@@ -148,7 +148,11 @@ def exit_slide(pc: WillowPlayerController) -> None:
         return
     OWN_SLIDE_STATE.is_sliding = False
     pc.Pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-    dbg(f"EXIT client={is_client()} suppressed={suppressed_count()}")
+    adopted, worst = adopted_stats()
+    dbg(
+        f"EXIT client={is_client()} suppressed={suppressed_count()}"
+        f" adopted={adopted} worst_gap={worst:.0f}",
+    )
     server_exit_slide()
     events.fire(events.slide_ended, pc)
 

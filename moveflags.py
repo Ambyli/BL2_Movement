@@ -33,7 +33,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from unrealsdk.hooks import Block, Type, add_hook, prevent_hooking_direct_calls, remove_hook
 
-from .debug import dbg
+from .config import trust_client_slides
+from .debug import dbg, note_adopted
 from .lifecycle import begin_server_slide, end_server_slide
 from .movement import apply_slide_physics, slide
 from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, is_client
@@ -56,6 +57,13 @@ INJECT_FUNCS = (
 READ_FUNCS = ("Engine.PlayerController:MoveAutonomous",)
 DRIVE_ID = "SlidingFlagDrive"
 DRIVE_FUNCS = ("Engine.PlayerController:MoveAutonomous",)
+
+TRUST_ID = "SlidingTrustClient"
+TRUST_FUNCS = (
+    "Engine.PlayerController:ServerMove",
+    "Engine.PlayerController:PCServerMoveInner",
+    "WillowGame.WillowPlayerController:ShortServerMove",
+)
 
 
 class _Flags:
@@ -189,6 +197,80 @@ def _drive_remote_slide(
         return
 
 
+class _Trust:
+    reported: ClassVar[bool] = False
+
+
+def _claimed_location(args: unreal.WrappedStruct) -> Any:
+    """The position the client says it reached, whatever this ServerMove variant calls it."""
+    for field in ("ClientLoc", "ClientLocation", "InClientLoc"):
+        try:
+            return getattr(args, field)
+        except Exception:  # noqa: BLE001 - variant without this name
+            continue
+    return None
+
+
+def _trust_client_position(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """Adopt a sliding client's own position on the host, rather than simulating against it.
+
+    Three attempts were made to have the server reproduce the slide from its own physics - forcing
+    velocity on the host tick, then in a post hook where the movement actually integrates, with the
+    slide state delivered on the move stream so the timing was right. All three drifted, because two
+    independent simulations running on different clocks from different inputs do not converge, and
+    the hooks that would make them converge - a SavedMove subclass, a custom physics mode - need
+    script we cannot compile.
+
+    Measured drift was 293 units growing to 549 across a single slide, along a fixed heading: the
+    client sliding away with the server standing still. That gap is what arrives as a teleport when
+    corrections resume.
+
+    So this stops trying to agree and removes the disagreement instead. The client is authoritative
+    over its own position for the length of a slide - about a second and a half - and the server
+    follows. The position adopted is one the client's own collision already accepted, so it is a
+    legal place to stand rather than an arbitrary point.
+    """
+    if is_client() or not trust_client_slides.value:
+        return
+    try:
+        pc = cast("WillowPlayerController", obj)
+        pawn = pc.Pawn
+        if pawn is None:
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    for player in CLIENTS_SLIDE_STATES.copy():
+        if (_pc := player()) is None:
+            CLIENTS_SLIDE_STATES.pop(player)
+            continue
+        if _pc != pc or not CLIENTS_SLIDE_STATES[player].is_sliding:
+            continue
+
+        if (claimed := _claimed_location(args)) is None:
+            return
+        try:
+            here = pawn.Location
+            gap = (
+                (claimed.X - here.X) ** 2 + (claimed.Y - here.Y) ** 2 + (claimed.Z - here.Z) ** 2
+            ) ** 0.5
+            pawn.SetLocation(claimed)
+        except Exception as ex:  # noqa: BLE001 - must never break the move path
+            dbg(f"TRUST FAILED {type(ex).__name__}: {ex}")
+            return
+
+        note_adopted(gap)
+        if not _Trust.reported:
+            _Trust.reported = True
+            dbg(f"TRUST live: closed a {gap:.0f} unit gap on the first adopted move")
+        return
+
+
 def enable_move_flags() -> None:
     for name in INJECT_FUNCS:
         try:
@@ -214,6 +296,14 @@ def enable_move_flags() -> None:
             continue
         dbg(f"FLAG drive hook on {name}: {'added' if added else 'refused'}")
 
+    for name in TRUST_FUNCS:
+        try:
+            added = add_hook(name, Type.POST, TRUST_ID, _trust_client_position)
+        except Exception as ex:  # noqa: BLE001 - a missing variant is expected, not fatal
+            dbg(f"TRUST could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        dbg(f"TRUST hook on {name}: {'added' if added else 'refused'}")
+
 
 def disable_move_flags() -> None:
     for name in INJECT_FUNCS:
@@ -229,6 +319,11 @@ def disable_move_flags() -> None:
     for name in DRIVE_FUNCS:
         try:
             remove_hook(name, Type.POST, DRIVE_ID)
+        except Exception:  # noqa: BLE001, S110
+            pass
+    for name in TRUST_FUNCS:
+        try:
+            remove_hook(name, Type.POST, TRUST_ID)
         except Exception:  # noqa: BLE001, S110
             pass
     _Flags.last_seen.clear()
