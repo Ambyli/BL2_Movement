@@ -21,7 +21,19 @@ All exposed as live sliders in the mod menu — changes take effect without a re
 | Max Turn | How far, in degrees, a slide can rotate from its entry heading. |
 
 ## Co-op
-Requires the mod on every player in the session. Movement is host-authoritative, so remote players slide correctly whatever the host is doing — jumping, driving, or sitting in a menu.
+Requires the mod on every player in the session. Both the client and the host run the same slide-physics code on their copy of the sliding pawn, so their simulations agree by construction. No position corrections fire during a slide, and no teleport lands when it ends.
+
+## How the sync works
+
+The mod hooks BL2's per-frame walking-physics function (`Engine.Pawn:PhysWalking`) with a PRE hook that returns the `Block` sentinel when the pawn is sliding. That skips the engine's normal walking body entirely and runs a custom slide step inline: decay the speed curve against the slope, apply the steering blend + turn-cone clamp, then call `pawn.MoveSmooth(delta)` so BL2's own collision code handles wall-slide and step-up.
+
+Because the same hook runs on both machines, driven by the same inputs replicated through the normal move stream, the two simulations produce identical positions. This is functionally equivalent to what a native UE3 developer would do by adding a new `PHYS_Sliding` physics mode — we can't literally add an enum value from Python, but a PRE hook that blocks the native call and runs its own body is the same dispatch.
+
+Enter/exit is signalled two ways in parallel, and whichever arrives first wins (the other is a no-op via idempotency):
+- A `broadcast` RPC (`server_enter_slide` / `server_exit_slide`) — reliable but arrives tens of ms late.
+- A bit in `SavedMove.CompressedFlags` — travels with the move packet itself, applied on the exact move the client made the transition on.
+
+The slide-jump keeps its momentum via a two-frame handoff: the local Jump hook stashes the current horizontal velocity, and the next PlayerMove PRE hook calls `pawn.DoJump(True)` on the ground frame and fires `server_set_slide_jump_velocity(vx, vy)` on the airborne frame.
 
 ## Development
 
@@ -48,6 +60,8 @@ The `--no-sync` flag skips uv's implicit dependency resolution — the mod's run
 
 The suite covers the pure slide math: entry-heading lock in `state.begin_slide_state`, the decay curve and exit triggers in `movement.slide`, and the steering blend / back-input filter / turn-cone clamp / pawn writes in `movement.apply_slide_physics`. Tests never load the game — `tests/conftest.py` installs stand-in modules into `sys.modules` before any test imports the mod, with a working `Vector` implementation for the vector math and minimal fakes for everything else.
 
+`tests/simulate_slide.py` is a diagnostic that runs the actual `_phys_sliding` hook against two fake pawns (client and host) frame-by-frame and prints their positions. Useful for confirming the sync stays stable after any change to the slide-physics body.
+
 When adding tests for new pure-math paths, extend `conftest.py` if the code touches a game API not already stubbed. Anything that reaches through hooks or replication is out of scope here and needs to be verified in-game.
 
 ### Lint
@@ -59,4 +73,4 @@ uv run --no-sync ruff check .
 Ruff rules and per-file exceptions live in `pyproject.toml` under `[tool.ruff]`.
 
 ## Credits
-Fork of [juso40's original Sliding mod](https://github.com/juso40/bl2sdk-mods). The movement core has been rewritten around a host-driven state model with steering, a turn-limit backstop, and a locked slide speed.
+Fork of [juso40's original Sliding mod](https://github.com/juso40/bl2sdk-mods). The movement core has been rewritten around a custom physics-mode hook (`PhysWalking` PRE + `Block`) that runs identical slide logic on client and host, with steering, a turn-limit backstop, a locked slide speed, and a momentum-preserving slide-jump.
