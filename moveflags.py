@@ -234,6 +234,12 @@ def _trust_client_position(
     over its own position for the length of a slide - about a second and a half - and the server
     follows. The position adopted is one the client's own collision already accepted, so it is a
     legal place to stand rather than an arbitrary point.
+
+    This must be a *pre* hook. `ServerMove` simulates the move, compares the result against the
+    position the client claimed, and sends a correction if they differ - all before it returns. A
+    post hook adopted the position faithfully and still left the correction already on the wire,
+    which measured as a 303 unit gap being closed one step after it had been acted on. Adopting
+    first means the comparison the server makes is against a position it already agrees with.
     """
     if is_client() or not trust_client_slides.value:
         return
@@ -298,7 +304,7 @@ def enable_move_flags() -> None:
 
     for name in TRUST_FUNCS:
         try:
-            added = add_hook(name, Type.POST, TRUST_ID, _trust_client_position)
+            added = add_hook(name, Type.PRE, TRUST_ID, _trust_client_position)
         except Exception as ex:  # noqa: BLE001 - a missing variant is expected, not fatal
             dbg(f"TRUST could not hook {name}: {type(ex).__name__}: {ex}")
             continue
@@ -323,7 +329,7 @@ def disable_move_flags() -> None:
             pass
     for name in TRUST_FUNCS:
         try:
-            remove_hook(name, Type.POST, TRUST_ID)
+            remove_hook(name, Type.PRE, TRUST_ID)
         except Exception:  # noqa: BLE001, S110
             pass
     _Flags.last_seen.clear()

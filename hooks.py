@@ -13,7 +13,7 @@ from .config import CROUCHED_PCT_DEFAULT, max_duration, smooth_coop_slides
 from .debug import dbg, note_suppressed
 from .lifecycle import enter_slide, exit_slide, server_set_slide_jump_velocity
 from .movement import apply_slide_physics, can_slide, drive_hosted_slides, slide
-from .state import OWN_SLIDE_STATE, State, is_client
+from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, State, is_client
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -184,15 +184,39 @@ CORRECTION_FUNCS = (
 )
 
 
+def _is_remote_sliding(pc: unreal.UObject) -> bool:
+    """Whether the host has a live slide recorded for this controller."""
+    for player in CLIENTS_SLIDE_STATES.copy():
+        if (_pc := player()) is None:
+            CLIENTS_SLIDE_STATES.pop(player)
+        elif _pc == pc:
+            return CLIENTS_SLIDE_STATES[player].is_sliding
+    return False
+
+
 def _suppress_correction(
-    _obj: unreal.UObject,
+    obj: unreal.UObject,
     _args: unreal.WrappedStruct,
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> type[Block] | None:
-    """Drop a server position correction aimed at us, while we are mid-slide."""
-    if not smooth_coop_slides.value or not OWN_SLIDE_STATE.is_sliding or not is_client():
+    """Drop a position correction for a slide, at whichever end sees it.
+
+    Blocking on the host matters more than blocking on the client. `ClientAdjustPosition` is a
+    client function the server *calls*, so stopping it there means the correction is never sent at
+    all - no bandwidth spent, and the client's move acknowledgement bookkeeping stays consistent
+    with the server's. Blocking it on the client only discards a packet that has already been sent
+    and already been counted against us.
+    """
+    if not smooth_coop_slides.value:
         return None
+
+    if is_client():
+        if not OWN_SLIDE_STATE.is_sliding:
+            return None
+    elif not _is_remote_sliding(obj):
+        return None
+
     note_suppressed()
     return Block
 

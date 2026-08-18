@@ -46,10 +46,10 @@ def adopted_stats() -> tuple[int, float]:
 
 def reset_suppressed() -> None:
     """Zero the count, so each slide reports its own figure rather than a running total."""
-    global _suppressed, _adopted, _worst_gap  # noqa: PLW0603 - module-level counters
+    # Only the suppression count is per-slide. Adoption is about *other* players' slides, so
+    # zeroing it when our own slide starts reported 0 every time while it was actually working.
+    global _suppressed  # noqa: PLW0603 - module-level counter is the point
     _suppressed = 0
-    _adopted = 0
-    _worst_gap = 0.0
 
 
 def dbg(msg: str) -> None:
