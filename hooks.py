@@ -5,16 +5,15 @@ from __future__ import annotations
 import contextlib
 from typing import TYPE_CHECKING, Any, cast
 
-from mods_base import hook
+from mods_base import get_pc, hook
 from uemath import Vector
 from unrealsdk import unreal
 from unrealsdk.hooks import Block, Type, add_hook, remove_hook
 
-from .config import CROUCHED_PCT_DEFAULT, max_duration, smooth_coop_slides
-from .debug import dbg, note_suppressed
-from .lifecycle import enter_slide, exit_slide, server_set_slide_jump_velocity
-from .movement import apply_slide_physics, can_slide, drive_hosted_slides, slide
-from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, State, is_client
+from .debug import dbg
+from .lifecycle import client_exit_slide, enter_slide, server_set_slide_jump_velocity
+from .movement import apply_slide_physics, slide
+from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, PlayerSlideState, State
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -46,88 +45,34 @@ def jump(
 @hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove")
 def handle_move(
     obj: unreal.UObject,
-    args: unreal.WrappedStruct,
+    _args: unreal.WrappedStruct,
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """PRE hook on the walking-state per-frame move.
+    """PRE hook on the walking-state per-frame move - now only handles the slide-jump handoff.
 
-    Runs on: BOTH host and client. Behaviour branches on `is_client()` - the host drives every
-    remote slide from here (as a fallback for the PlayerTick hook), while both sides advance their
-    own local slide and check the exit conditions.
+    Runs on: BOTH host and client. All slide integration, decay, and exit-condition work has moved
+    into the PhysWalking PRE hook (`_phys_sliding`). What remains here is the two-frame slide-jump
+    dance: when Jump was pressed while sliding, the jump hook stashes horizontal velocity and sets
+    `State.do_slide_jump`. On this frame's PlayerMove PRE, if we are still grounded we fire
+    `DoJump(True)` to leave the ground; on the next fire (once airborne), we broadcast the stashed
+    velocity to the host so its copy of the pawn keeps the momentum through the arc.
     """
-    pc = cast("WillowPlayerController", obj)
-    pawn = cast("WillowPlayerPawn", pc.Pawn)
-
-    # Host duty first, and unconditionally - it must not sit behind our own slide's exit checks
-    # below. Usually the player tick hook has already covered this frame and the call is a no-op;
-    # it stays as a fallback for the case where that hook never registers.
-    if not is_client():
-        drive_hosted_slides(pc, args.DeltaTime, "PlayerMove")
-
-    # Jumping stands you up, which fails the slide exit conditions below, so the slide jump has to
-    # be handled before any of them get a chance to run.
-    if State.do_slide_jump:
-        if pawn.IsOnGroundOrShortFall():
-            pawn.DoJump(True)
-        else:
-            server_set_slide_jump_velocity(
-                State.horizontal_velocity.x, State.horizontal_velocity.y
-            )
-            State.do_slide_jump = False
-            return
-
-    # Physical exit conditions: duck released, off the ground, or OWN_SLIDE_STATE flag already
-    # cleared by a targeted client_exit_slide message from the host. Any of these ends the slide
-    # cleanly before the decay math below has a chance to touch the state.
-    if not can_slide(pc, pawn):
-        exit_slide(pc)
+    if not State.do_slide_jump:
         return
 
-    # A client owns only its own slide; the host already advanced its entry above.
-    if is_client():
-        slide(pc, OWN_SLIDE_STATE, args.DeltaTime)
-
-    # Speed-and-duration exit: decay has bled the slide below the walking-crouch multiplier, or
-    # the hard duration cap has hit. Either way we end the slide from this frame instead of the
-    # next, so exit_slide's server_exit_slide broadcast leaves the wire as promptly as possible.
-    if (
-        OWN_SLIDE_STATE.speed_pct < CROUCHED_PCT_DEFAULT
-        or OWN_SLIDE_STATE.elapsed >= max_duration.value
-    ):
-        exit_slide(pc)
-
-
-@hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove", Type.POST)
-def enforce_slide(
-    obj: unreal.UObject,
-    args: unreal.WrappedStruct,
-    _ret: Any,
-    _func: unreal.BoundFunction,
-) -> None:
-    """Reassert the slide once PlayerMove has finished recomputing movement from input.
-
-    Runs on: BOTH, but only does work for the machine that owns the local slide. Twin of
-    moveflags._drive_remote_slide, which does the equivalent job for remote pawns on the host.
-    """
-    # We only touch the pawn if this machine's local player is the one sliding. Every other player
-    # is either the host's simulation of a remote client (handled by drive_remote_slide) or a
-    # non-sliding pawn we do not need to touch.
-    if not OWN_SLIDE_STATE.is_sliding:
-        return
     pc = cast("WillowPlayerController", obj)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
-    # Pawn can be None during respawn or level transitions where PlayerMove still fires against
-    # a stub controller. Bail rather than reach into a null.
     if pawn is None:
         return
-    # apply_slide_physics is the only place velocity actually lands on the pawn, so a failure here
-    # would leave the slide state advancing without any visible motion. Log rather than raise, so
-    # a diagnostic bug doesn't take the whole movement path down.
-    try:
-        apply_slide_physics(pawn, OWN_SLIDE_STATE, args.DeltaTime)
-    except Exception as ex:  # noqa: BLE001 - temporary diagnostics
-        dbg(f"POST FAILED {type(ex).__name__}: {ex}")
+
+    if pawn.IsOnGroundOrShortFall():
+        pawn.DoJump(True)
+    else:
+        server_set_slide_jump_velocity(
+            State.horizontal_velocity.x, State.horizontal_velocity.y,
+        )
+        State.do_slide_jump = False
 
 
 @hook("WillowGame.WillowPlayerInput:DuckPressed")
@@ -158,205 +103,128 @@ def handle_duck(
             dbg(f"ENTER FAILED {type(ex).__name__}: {ex}")
 
 
-# --- host tick -----------------------------------------------------------------------------------
-# PlayerMove only fires while the host is in the walking state, so the moment the host jumps, boards
-# a vehicle or opens a menu it stops driving everyone else's slide. PlayerTick runs every frame in
-# every state, which is what the host duty actually needs.
-#
-# Registered by hand rather than with the decorator because it is not knowable from outside the game
-# whether WillowPlayerController overrides PlayerTick or inherits it - hooking the wrong one would
-# silently never fire. Both are attempted; if the override exists and chains to its parent then both
-# fire, which the per-frame dedup in drive_hosted_slides already handles.
+# --- physics-mode slide ----------------------------------------------------------------------------
+# PhysWalking is the pawn-side walking-physics function that the engine dispatches to each frame
+# while the pawn is in PHYS_Walking. Hooking it PRE and returning Block lets us skip its native body
+# and run our own slide physics inline - functionally equivalent to a bespoke PHYS_Sliding mode that
+# we cannot add as an enum value. Because PhysWalking fires on both the client's own pawn (via
+# PlayerMove -> PhysicsTick -> PhysWalking) and the host's copy of every remote pawn (via
+# AutonomousPhysics -> PhysWalking), one hook covers both machines' paths.
 
-HOST_TICK_ID = "SlidingHostTick"
-PLAYER_TICK_FUNCS = (
-    "WillowGame.WillowPlayerController:PlayerTick",
-    "Engine.PlayerController:PlayerTick",
+PHYS_SLIDING_ID = "SlidingPhysWalking"
+PHYS_SLIDING_FUNCS = (
+    "Engine.Pawn:PhysWalking",
 )
 
 
-def _host_tick(
-    obj: unreal.UObject,
-    args: unreal.WrappedStruct,
-    _ret: Any,
-    _func: unreal.BoundFunction,
-) -> None:
-    """PRE hook on PlayerTick, driving the host duty every frame regardless of movement state.
-
-    Runs on: HOST only. Fires on every rendered frame - including while the host is airborne, in
-    a vehicle, or has a menu open, all cases where PlayerMove stops firing. drive_hosted_slides
-    dedupes by world time, so this becomes a no-op on frames where PlayerMove already ran.
+def _state_for_pawn(pc: unreal.UObject) -> PlayerSlideState | None:
+    """Return the slide state that governs this controller's pawn this frame, or None if not
+    sliding. Local player uses OWN_SLIDE_STATE; every other player looks up in CLIENTS_SLIDE_STATES.
     """
-    # Client machines never own remote slide state; only the host has anything to drive.
-    if is_client():
-        return
-    # PlayerTick's args carry DeltaTime, but which variant this hook lands on isn't knowable in
-    # advance (WillowPlayerController override or Engine.PlayerController base). Use getattr so
-    # the wrong variant just becomes a zero and returns below rather than raising.
-    delta_time = float(getattr(args, "DeltaTime", 0.0) or 0.0)
-    if delta_time <= 0.0:
-        return
-    # An exception in the host duty must never propagate up into PlayerTick, or every remote
-    # player's controller stops ticking. Log and swallow; the next frame gets another chance.
     try:
-        drive_hosted_slides(
-            cast("WillowPlayerController", obj), delta_time, "PlayerTick"
-        )
-    except Exception as ex:  # noqa: BLE001 - must never break the controller's tick
-        dbg(f"HOST TICK FAILED {type(ex).__name__}: {ex}")
-
-
-def enable_host_tick() -> None:
-    """Wire the PlayerTick host-duty hook. Runs on: BOTH, at mod-enable.
-
-    Both candidate function names are attempted; whichever exists in this build wins, and if
-    both do, the per-frame dedup handles the overlap.
-    """
-    # Try each candidate in turn. One or both may be valid depending on whether
-    # WillowPlayerController overrides PlayerTick in this build; a raise here means the name did
-    # not resolve, which is expected for the losing candidate and never fatal.
-    for name in PLAYER_TICK_FUNCS:
-        try:
-            added = add_hook(name, Type.PRE, HOST_TICK_ID, _host_tick)
-        except (
-            Exception
-        ) as ex:  # noqa: BLE001 - a missing candidate is expected, not fatal
-            dbg(f"HOST TICK could not hook {name}: {type(ex).__name__}: {ex}")
-            continue
-        # Log the outcome per candidate so the debug log tells us exactly which of the two took
-        # (or if neither did, in which case the host duty falls back to PlayerMove alone).
-        dbg(f"HOST TICK hook on {name}: {'added' if added else 'refused'}")
-
-
-def disable_host_tick() -> None:
-    """Unwire the PlayerTick host-duty hook. Runs on: BOTH, at mod-disable."""
-    for name in PLAYER_TICK_FUNCS:
-        # A missing hook is expected - it may have failed to register on `enable_host_tick`.
-        with contextlib.suppress(Exception):
-            remove_hook(name, Type.PRE, HOST_TICK_ID)
-
-
-# --- correction suppression ------------------------------------------------------------------------
-# With the host now told about a client's slide, it simulates one at ~960 uu/s against the client's
-# predicted 970. That last percent is enough for the server to disagree every packet, and it corrects
-# around forty times a second for the whole slide - small individually, constant stutter in aggregate.
-#
-# Blocking those for the duration of a slide is a real trade, not a free win: the client's prediction
-# becomes authoritative for ~1.5s, and any genuine disagreement lands as one correction at the end
-# rather than being bled off continuously. In co-op PvE that is the better bargain, but it is behind
-# an option so it can be turned off and compared.
-
-CORRECTION_ID = "SlidingSuppressCorrection"
-CORRECTION_FUNCS = (
-    "Engine.PlayerController:ClientAdjustPosition",
-    "Engine.PlayerController:LongClientAdjustPosition",
-    "Engine.PlayerController:ShortClientAdjustPosition",
-    "Engine.PlayerController:VeryShortClientAdjustPosition",
-)
-
-
-class _CorrectionLog:
-    reported_miss: ClassVar[bool] = False
-
-
-def _is_remote_sliding(pc: unreal.UObject) -> bool:
-    """Whether the host has a live slide recorded for this controller.
-
-    Runs on: HOST only. Called from _suppress_correction to decide whether a correction packet
-    that's about to be sent to `pc` should be dropped.
-    """
-    # Walk the dict, sweeping GC'd weak pointers on the way. `.copy()` because we may mutate
-    # inside the loop.
+        local_pc = get_pc()
+    except Exception:  # noqa: BLE001 - happens transiently during map load
+        local_pc = None
+    if pc == local_pc:
+        return OWN_SLIDE_STATE if OWN_SLIDE_STATE.is_sliding else None
     for player in CLIENTS_SLIDE_STATES.copy():
         if (_pc := player()) is None:
             CLIENTS_SLIDE_STATES.pop(player)
         elif _pc == pc:
-            # Found this controller. The is_sliding flag is authoritative here; a stale entry
-            # with is_sliding=False is exactly the same as "no entry", which is what we want.
-            return CLIENTS_SLIDE_STATES[player].is_sliding
-    return False
+            state = CLIENTS_SLIDE_STATES[player]
+            return state if state.is_sliding else None
+    return None
 
 
-def _suppress_correction(
+def _phys_sliding(
     obj: unreal.UObject,
-    _args: unreal.WrappedStruct,
+    args: unreal.WrappedStruct,
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> type[Block] | None:
-    """Drop a position correction for a slide, at whichever end sees it.
+    """Slide-physics PRE hook. Returns Block to skip native PhysWalking when the pawn is sliding.
 
-    Blocking on the host matters more than blocking on the client. `ClientAdjustPosition` is a
-    client function the server *calls*, so stopping it there means the correction is never sent at
-    all - no bandwidth spent, and the client's move acknowledgement bookkeeping stays consistent
-    with the server's. Blocking it on the client only discards a packet that has already been sent
-    and already been counted against us.
-
-    Runs on: BOTH, with different tests. On the host it fires when the server is about to send a
-    correction to a client; on the client it fires when the correction has arrived. Same block
-    result either way.
+    Runs on: BOTH. Fires per-frame on every pawn whose walking-physics is about to run. Pawns that
+    are not sliding fall through to native PhysWalking (return None); sliding pawns get their
+    physics computed here and PhysWalking is skipped entirely.
     """
-    # Feature switch. Left off, this hook is registered but always no-ops.
-    if not smooth_coop_slides.value:
+    pawn = cast("WillowPlayerPawn", obj)
+    pc = getattr(pawn, "Controller", None)
+    if pc is None:
         return None
 
-    # Client-side firing: only suppress if this client is the one sliding. Other clients'
-    # corrections have nothing to do with our slide state.
-    if is_client():
-        if not OWN_SLIDE_STATE.is_sliding:
+    state = _state_for_pawn(pc)
+    if state is None:
+        return None
+
+    try:
+        delta_time = float(getattr(args, "DeltaTime", 0.0) or 0.0)
+    except Exception:  # noqa: BLE001
+        return None
+    if delta_time <= 0.0:
+        return None
+
+    try:
+        # Decay speed_pct against the slope, and fire the targeted exit RPC if the floor is hit.
+        # slide() may set state.is_sliding to False; check afterwards before continuing.
+        slide(pc, state, delta_time)
+        if not state.is_sliding:
             return None
-    # Host-side firing: only suppress corrections addressed to a player the host believes is
-    # sliding. A correction to any other player is a legitimate walking-physics disagreement.
-    elif not _is_remote_sliding(obj):
-        # Say so once. A correction going out to a player the host does not believe is sliding is
-        # the whole failure, and it is invisible unless it is named.
-        if not _CorrectionLog.reported_miss:
-            _CorrectionLog.reported_miss = True
-            try:
-                who = str(obj.PlayerReplicationInfo.PlayerName)
-            except Exception:  # noqa: BLE001
-                who = "?"
-            dbg(f"SUPPRESS MISS correcting={who} but no live slide on file for them")
+
+        # Fallback heading lock. begin_slide_state on the host reads its own simulated pawn.Velocity
+        # which can be stale on the first frame - if it was below the 1uu/s floor, dir/entry got
+        # left at (0,0). By the time PhysWalking fires, pawn.Velocity has been replicated at least
+        # once from BL2's normal pawn stream and is a truer sample. Use it to lock heading now.
+        if state.dir_x == 0.0 and state.dir_y == 0.0:
+            vel = Vector(pawn.Velocity)
+            vel.z = 0
+            if vel.magnitude >= 1.0:
+                vel.normalize()
+                state.dir_x = vel.x
+                state.dir_y = vel.y
+                state.entry_x = vel.x
+                state.entry_y = vel.y
+
+        # Steer (with back-cutoff + turn-cone clamp) and write Velocity/Acceleration/CrouchedPct
+        # onto the pawn. Same math as the previous POST-hook enforce_slide path, minus the
+        # post-integration assumption - we integrate ourselves next.
+        apply_slide_physics(pawn, state, delta_time)
+
+        # Integrate: move the pawn using the engine's own collision. MoveSmooth handles wall-slide
+        # and step-up so we do not have to trace collision manually.
+        vel = pawn.Velocity
+        pawn.MoveSmooth(
+            (float(vel.X) * delta_time, float(vel.Y) * delta_time, 0.0),
+        )
+
+        # Extra exit condition: duck released. slide() already checks speed floor and duration cap.
+        if not bool(getattr(pc, "bDuck", False)):
+            client_exit_slide(pc.PlayerReplicationInfo)
+    except Exception as ex:  # noqa: BLE001 - defensive: on failure, fall back to native walking
+        dbg(f"PHYS SLIDING FAILED {type(ex).__name__}: {ex}")
         return None
 
-    # Count the suppression for the per-slide diagnostic, then return the Block sentinel - which
-    # tells pyunrealsdk to drop the native call. On the host side that means the correction
-    # packet is never sent; on the client it means the correction that just arrived is discarded.
-    note_suppressed()
     return Block
 
 
-def enable_correction_suppression() -> None:
-    """Wire the correction-blocking PRE hook. Runs on: BOTH, at mod-enable.
-
-    All four `ClientAdjustPosition` variants are attempted so we catch whichever BL2 uses for a
-    given correction size (very-short / short / long / normal).
-    """
-    # Try each variant. Only some will resolve in a given BL2 build; the ones that raise are
-    # expected and get logged, not treated as failure. Any correction path that BL2 uses in the
-    # end has to land in one of these four.
-    for name in CORRECTION_FUNCS:
+def enable_phys_sliding() -> None:
+    """Wire the PhysWalking PRE hook. Runs on: BOTH, at mod-enable."""
+    for name in PHYS_SLIDING_FUNCS:
         try:
-            added = add_hook(name, Type.PRE, CORRECTION_ID, _suppress_correction)
-        except (
-            Exception
-        ) as ex:  # noqa: BLE001 - a missing variant is expected, not fatal
-            dbg(f"SUPPRESS could not hook {name}: {type(ex).__name__}: {ex}")
+            added = add_hook(name, Type.PRE, PHYS_SLIDING_ID, _phys_sliding)
+        except Exception as ex:  # noqa: BLE001 - if PhysWalking can't be hooked, log and continue
+            dbg(f"PHYS SLIDING could not hook {name}: {type(ex).__name__}: {ex}")
             continue
-        dbg(f"SUPPRESS hook on {name}: {'added' if added else 'refused'}")
+        dbg(f"PHYS SLIDING hook on {name}: {'added' if added else 'refused'}")
 
 
-def disable_correction_suppression() -> None:
-    """Unwire correction-blocking hooks. Runs on: BOTH, at mod-disable."""
-    # Same symmetry - remove all four whether or not they were successfully registered. A missing
-    # hook is exactly what we want here anyway; catching the exception avoids a distracting
-    # traceback at mod-disable time.
-    for name in CORRECTION_FUNCS:
-        try:
-            remove_hook(name, Type.PRE, CORRECTION_ID)
-        except Exception:  # noqa: BLE001, S110 - nothing to do if it was never added
-            pass
+def disable_phys_sliding() -> None:
+    """Unwire the PhysWalking PRE hook. Runs on: BOTH, at mod-disable."""
+    for name in PHYS_SLIDING_FUNCS:
+        with contextlib.suppress(Exception):
+            remove_hook(name, Type.PRE, PHYS_SLIDING_ID)
 
 
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
-all_hooks = [handle_move, enforce_slide, handle_duck, jump]
+all_hooks = [handle_move, handle_duck, jump]

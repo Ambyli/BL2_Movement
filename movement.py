@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar
 
 from uemath import Vector
 
@@ -20,7 +20,7 @@ from .config import (
 )
 from .debug import dbg
 from .lifecycle import client_exit_slide
-from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, PlayerSlideState, world_time
+from .state import OWN_SLIDE_STATE, PlayerSlideState
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -183,90 +183,8 @@ def apply_slide_physics(
         dbg(f"POST {_who(pawn)} pct={slide_data.speed_pct:.2f} set={speed:.0f}")
 
 
-class _HostTick:
-    """Which frame the host duty last ran on, and where it was driven from."""
-
-    last_world_time: ClassVar[float] = -1.0
-    reported_source: ClassVar[str] = ""
-
-
-def drive_hosted_slides(
-    local_pc: WillowPlayerController,
-    delta_time: float,
-    source: str,
-) -> None:
-    """Single entry point for the host duty, collapsed to once per frame.
-
-    This is driven from more than one hook so it keeps running whatever state the host is in -
-    PlayerMove stops firing the moment the host jumps or gets in a vehicle, which would strand
-    every other player's slide. The dedup matters because those hooks can both fire on the same
-    frame, and running twice would decay every slide at double rate.
-
-    Runs on: HOST only. Callers are `handle_move` (PRE PlayerMove) and `_host_tick` (PRE
-    PlayerTick). Whichever fires first this frame wins; the other is a no-op via the world-time
-    dedup below.
-    """
-    # World-time dedup. Both callers may fire on the same frame; the first to arrive stamps this
-    # frame's timestamp and does the work, and the second returns immediately.
-    now = world_time()
-    if now == _HostTick.last_world_time:
-        return
-    _HostTick.last_world_time = now
-
-    # Log the transition when the driver changes (usually PlayerTick after enable, occasionally
-    # PlayerMove when the tick hook failed to register). Steady-state produces no output.
-    if _HostTick.reported_source != source:
-        _HostTick.reported_source = source
-        dbg(f"HOST TICK now driven by {source}")
-
-    tick_hosted_slides(local_pc, delta_time)
-
-
-def tick_hosted_slides(local_pc: WillowPlayerController, delta_time: float) -> None:
-    """Drive every slide the host is responsible for. Host only, every frame, unconditionally.
-
-    BL2 is server authoritative over movement, so a remote player's slide has to be forced on the
-    server too. Without it the host simulates them from their replicated input - which, mid-slide
-    with no key held, is nothing - decides they should be stationary, and corrects them out of the
-    slide as fast as they predict themselves into it.
-
-    Our own entry is only decayed here, not forced: the local pawn is driven from the post hook
-    instead, after PlayerMove has stopped overwriting it.
-
-    Runs on: HOST only. Called from `drive_hosted_slides` after the once-per-frame dedup. As of
-    the MoveAutonomous POST refactor, this only touches the host's OWN slide entry - remote
-    clients are decayed and forced from `_drive_remote_slide` on the client's move clock instead.
-    """
-    # Walk the dict once, sweeping dead weak-refs as we go. Only our own entry is decayed here
-    # after the MoveAutonomous refactor; the rest of the dict is simulated on client move clocks.
-    for player in CLIENTS_SLIDE_STATES.copy():
-        if (_pc := player()) is None:
-            CLIENTS_SLIDE_STATES.pop(player)
-            continue
-
-        # An entry that's flagged not-sliding is a stale end-marker; we just leave it alone.
-        state = CLIENTS_SLIDE_STATES[player]
-        if not state.is_sliding:
-            continue
-
-        # Remote players are no longer driven from here. A remote pawn does not move on the host's
-        # frame at all - it moves inside MoveAutonomous, at packet rate - so both their decay and
-        # their forced velocity now live in the post hook on that function, where the writes land
-        # after the physics instead of being recomputed by it. This loop keeps only our own entry.
-        if _pc != local_pc:
-            continue
-
-        slide(_pc, state, delta_time)
-        # Mirror our own progress out, so the local exit checks still see it when we are the host
-        # and our state lives in this dict rather than in OWN_SLIDE_STATE.
-        OWN_SLIDE_STATE.speed_pct = state.speed_pct
-        OWN_SLIDE_STATE.elapsed = state.elapsed
-
-
 __all__ = [
     "apply_slide_physics",
     "can_slide",
-    "drive_hosted_slides",
     "slide",
-    "tick_hosted_slides",
 ]

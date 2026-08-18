@@ -8,7 +8,7 @@ or a slider change silently stops taking effect.
 
 from __future__ import annotations
 
-from mods_base import BoolOption, GroupedOption, SliderOption
+from mods_base import GroupedOption, SliderOption
 
 # Structural rather than feel dials, so they stay constants. SLIDE_SPEED_DEFAULT is where speed_pct
 # opens and the top of the decay range; CROUCHED_PCT_DEFAULT is both normal crouch speed and the
@@ -86,37 +86,9 @@ max_turn_degrees = SliderOption(
     ),
 )
 
-smooth_coop_slides = BoolOption(
-    "Smooth Co-op Slides",
-    True,
-    description=(
-        "Ignore the server's position corrections for the length of a slide, when you are the one"
-        " sliding as a client. The server simulates a slide about a percent slower than you"
-        " predict it, and corrects the difference around forty times a second, which is felt as"
-        " constant micro-stutter. Suppressing that for the ~1.5s of a slide trades it for one"
-        " correction at the end. Turn off to compare, or if you ever see yourself finish a slide"
-        " somewhere you did not expect."
-    ),
-)
-
-trust_client_slides = BoolOption(
-    "Trust Client Slides",
-    True,
-    description=(
-        "While a client is sliding, the host adopts the position that client reports instead of"
-        " simulating the slide itself. Two independent simulations with different clocks drift"
-        " apart no matter how closely their inputs are matched - measured at over 500 units by the"
-        " end of a single slide - and the snap you feel at the end is that gap being closed all at"
-        " once. Adopting the client's own position removes the gap by construction. This trusts the"
-        " sliding player for the ~1.5s of a slide, which is a fair trade in co-op against friends"
-        " and would not be in a competitive game."
-    ),
-)
-
 all_options = [
     GroupedOption(
         "Sliding",
         (start_speed, decay_rate, max_duration, steer_rate, max_turn_degrees),
     ),
-    GroupedOption("Multiplayer", (smooth_coop_slides, trust_client_slides)),
 ]

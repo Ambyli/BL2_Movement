@@ -107,14 +107,10 @@ def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
         begin_slide_state(cast("WillowPlayerPawn", pawn), data)
         CLIENTS_SLIDE_STATES[unreal.WeakPointer(pc)] = data
 
-    # Boost the replicated crouch multiplier so BL2's walking physics produces slide-scale speed
-    # on the host and on every remote observer of this pawn.
+    # Boost the replicated crouch multiplier so any observer sees slide-scale speed until the
+    # PhysWalking hook takes over integration on this pawn's next frame.
     pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
-    # Snapshot the server's start position so end_server_slide can report how far this pawn
-    # actually moved on the host - the headline diagnostic for whether the server tracked the
-    # client or stood still while the client ran ahead.
     loc = pawn.Location
-    data.server_start_x, data.server_start_y = float(loc.X), float(loc.Y)
     dbg(
         f"SLIDE_ON via={source} who={pc.PlayerReplicationInfo.PlayerName}"
         f" n={len(CLIENTS_SLIDE_STATES)} at=({loc.X:.0f},{loc.Y:.0f})",
@@ -148,20 +144,8 @@ def end_server_slide(pc: WillowPlayerController, source: str) -> bool:
             CLIENTS_SLIDE_STATES[player].is_sliding = False
             stopped = True
     if stopped:
-        # Only log/measure on the winning end call, not on duplicates.
-        # The number that settles whether the server followed. A client slide covers roughly 1450
-        # units; if the server's own pawn moved a fraction of that, it never tracked them, whatever
-        # the adoption counter says.
-        moved = "?"
-        if pawn is not None:
-            for player in CLIENTS_SLIDE_STATES.copy():
-                if (_pc := player()) is not None and _pc == pc:
-                    data = CLIENTS_SLIDE_STATES[player]
-                    dx = float(pawn.Location.X) - data.server_start_x
-                    dy = float(pawn.Location.Y) - data.server_start_y
-                    moved = f"{(dx * dx + dy * dy) ** 0.5:.0f}"
-                    break
-        dbg(f"SLIDE_OFF via={source} who={pc.PlayerReplicationInfo.PlayerName} server_moved={moved}")
+        # Only log on the winning end call, not on duplicates.
+        dbg(f"SLIDE_OFF via={source} who={pc.PlayerReplicationInfo.PlayerName}")
     # True: this call ended a live slide. False: it was already ended (or nothing to end).
     return stopped
 
