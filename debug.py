@@ -11,7 +11,7 @@ from pathlib import Path
 
 DEBUG_LOG: bool = True
 LOG_PATH = Path.home() / "bl2_slide_debug.log"
-MAX_LINES: int = 400
+MAX_LINES: int = 4000
 
 _count: int = 0
 

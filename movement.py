@@ -26,6 +26,14 @@ if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
 
 
+POST_LOG_EVERY: int = 30
+"""One line per this many forced frames. See the note in `apply_slide_physics`."""
+
+
+class _PostLog:
+    frames: ClassVar[int] = 0
+
+
 def can_slide(pc: WillowPlayerController, pawn: WillowPlayerPawn) -> bool:
     return OWN_SLIDE_STATE.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
 
@@ -121,7 +129,12 @@ def apply_slide_physics(
     pawn.Velocity.X = direction.x * speed
     pawn.Velocity.Y = direction.y * speed
 
-    dbg(f"POST pct={slide_data.speed_pct:.2f} set={speed:.0f}")
+    # Throttled deliberately. Logging this every frame burned 391 of the debug log's 400 lines on
+    # two slides and silently dropped the whole of the next session - the rare lines are the ones
+    # worth having, and per-frame detail crowds them out.
+    _PostLog.frames += 1
+    if _PostLog.frames % POST_LOG_EVERY == 0:
+        dbg(f"POST pct={slide_data.speed_pct:.2f} set={speed:.0f}")
 
 
 class _HostTick:

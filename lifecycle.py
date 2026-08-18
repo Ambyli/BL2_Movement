@@ -17,7 +17,13 @@ from unrealsdk import unreal
 from . import events
 from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT, start_speed
 from .debug import dbg
-from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, PlayerSlideState, begin_slide_state
+from .state import (
+    CLIENTS_SLIDE_STATES,
+    OWN_SLIDE_STATE,
+    PlayerSlideState,
+    begin_slide_state,
+    is_client,
+)
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -60,7 +66,7 @@ def server_enter_slide() -> None:
         CLIENTS_SLIDE_STATES[unreal.WeakPointer(pc)] = data
 
     pc.Pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
-    dbg(f"SERVER_ENTER ran, clients={len(CLIENTS_SLIDE_STATES)}")
+    dbg(f"SERVER_ENTER from={pc.PlayerReplicationInfo.PlayerName} clients={len(CLIENTS_SLIDE_STATES)}")
 
 
 def enter_slide(pc: WillowPlayerController) -> None:
@@ -73,7 +79,7 @@ def enter_slide(pc: WillowPlayerController) -> None:
     begin_slide_state(cast("WillowPlayerPawn", pc.Pawn), OWN_SLIDE_STATE)
     pc.Pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
     dbg(
-        f"ENTER_OWN speed={start_speed.value:.0f} "
+        f"ENTER_OWN client={is_client()} speed={start_speed.value:.0f} "
         f"dir=({OWN_SLIDE_STATE.dir_x:.2f},{OWN_SLIDE_STATE.dir_y:.2f}) "
         f"clients={len(CLIENTS_SLIDE_STATES)}",
     )
@@ -85,7 +91,7 @@ def exit_slide(pc: WillowPlayerController) -> None:
         return
     OWN_SLIDE_STATE.is_sliding = False
     pc.Pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-    dbg("EXIT")
+    dbg(f"EXIT client={is_client()}")
     server_exit_slide()
     events.fire(events.slide_ended, pc)
 
