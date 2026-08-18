@@ -31,6 +31,7 @@ events.slide_ended.append(viewmodel.on_end)
 # Temporary, removed with the rest of the diagnostics in the cleanup phase. It rides the same event
 # rather than hooking anything of its own, which is the point of the event list.
 events.slide_started.append(discovery.on_start)
+events.slide_ended.append(discovery.on_end)
 
 
 def _on_enable() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from mods_base import hook
 from uemath import Vector
@@ -184,6 +184,10 @@ CORRECTION_FUNCS = (
 )
 
 
+class _CorrectionLog:
+    reported_miss: ClassVar[bool] = False
+
+
 def _is_remote_sliding(pc: unreal.UObject) -> bool:
     """Whether the host has a live slide recorded for this controller."""
     for player in CLIENTS_SLIDE_STATES.copy():
@@ -215,6 +219,15 @@ def _suppress_correction(
         if not OWN_SLIDE_STATE.is_sliding:
             return None
     elif not _is_remote_sliding(obj):
+        # Say so once. A correction going out to a player the host does not believe is sliding is
+        # the whole failure, and it is invisible unless it is named.
+        if not _CorrectionLog.reported_miss:
+            _CorrectionLog.reported_miss = True
+            try:
+                who = str(obj.PlayerReplicationInfo.PlayerName)
+            except Exception:  # noqa: BLE001
+                who = "?"
+            dbg(f"SUPPRESS MISS correcting={who} but no live slide on file for them")
         return None
 
     note_suppressed()

@@ -104,6 +104,15 @@ SAVEDMOVE_FUNCS = (
 SAVEDMOVE_BOOLS = ("bSprint", "bRun", "bDuck", "bPressedJump", "bDoubleJump")
 MAX_SAVEDMOVE_FIRES: int = 40
 
+# The teleport watcher. Four fixes have each addressed a real defect without removing the jump the
+# player actually feels, so this stops reasoning about causes and records the event: sample the
+# pawn's position every frame across the end of a slide and report any step too large to be running.
+TELEPORT_ID = "SlidingDiscoveryTeleport"
+TELEPORT_FUNCS = ("Engine.PlayerController:PlayerTick",)
+TELEPORT_WATCH_FRAMES: int = 45
+TELEPORT_MIN_JUMP: float = 50.0
+MAX_TELEPORT_REPORTS: int = 12
+
 MOVEFLAG_ID = "SlidingDiscoveryMoveFlags"
 MOVEFLAG_FUNCS = ("Engine.PlayerController:MoveAutonomous",)
 MAX_MOVEFLAG_FIRES: int = 40
@@ -154,6 +163,9 @@ class _Progress:
     last_savedmove: ClassVar[str] = ""
     seen_flag_bits: ClassVar[int] = 0
     probed_flag_layout: ClassVar[bool] = False
+    watch_frames: ClassVar[int] = 0
+    watch_last: ClassVar[tuple[float, float, float] | None] = None
+    teleport_reports: ClassVar[int] = 0
     last_fire_args: ClassVar[dict[str, str]] = {}
     dumped_surface_props: ClassVar[bool] = False
     hud_seen: ClassVar[set[str]] = set()
@@ -955,6 +967,56 @@ def _hud_probe(
 # --- wiring ----------------------------------------------------------------------------------------
 
 
+def _teleport_watch(
+    obj: unreal.UObject,
+    _args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """Sample our own pawn's position across the end of a slide and report any jump.
+
+    Armed by `slide_ended`, so it costs nothing outside the window that matters. Reports the size and
+    direction of the step, which distinguishes a server correction pulling us back along the slide
+    from something else moving us entirely.
+    """
+    if _Progress.watch_frames <= 0:
+        return
+    _Progress.watch_frames -= 1
+    try:
+        location = obj.Pawn.Location
+        here = (float(location.X), float(location.Y), float(location.Z))
+    except Exception:  # noqa: BLE001 - no pawn this frame
+        return
+
+    previous = _Progress.watch_last
+    _Progress.watch_last = here
+    if previous is None:
+        return
+
+    dx, dy, dz = here[0] - previous[0], here[1] - previous[1], here[2] - previous[2]
+    step = (dx * dx + dy * dy + dz * dz) ** 0.5
+    if step < TELEPORT_MIN_JUMP or _Progress.teleport_reports >= MAX_TELEPORT_REPORTS:
+        return
+    _Progress.teleport_reports += 1
+    frame = TELEPORT_WATCH_FRAMES - _Progress.watch_frames
+    note(
+        f"TPORT #{_Progress.teleport_reports} frame+{frame} jump={step:.0f}"
+        f" d=({dx:.0f},{dy:.0f},{dz:.0f}) client={is_client()}",
+    )
+
+
+def on_end(pc: WillowPlayerController) -> None:
+    """Subscribed to `slide_ended`. Arms the teleport watcher for the next second or so."""
+    if not DISCOVERY:
+        return
+    _Progress.watch_frames = TELEPORT_WATCH_FRAMES
+    try:
+        location = pc.Pawn.Location
+        _Progress.watch_last = (float(location.X), float(location.Y), float(location.Z))
+    except Exception:  # noqa: BLE001
+        _Progress.watch_last = None
+
+
 def on_start(pc: WillowPlayerController) -> None:
     """Subscribed to `slide_started`. Everything expensive here is one-shot or throttled."""
     if not DISCOVERY:
@@ -994,6 +1056,16 @@ def enable() -> None:
         if added:
             _Progress.post_hooks.append(name)
         note(f"SMOVE hook {name}: {'added' if added else 'refused'}")
+
+    for name in TELEPORT_FUNCS:
+        try:
+            added = add_hook(name, Type.POST, TELEPORT_ID, _teleport_watch)
+        except Exception as ex:  # noqa: BLE001
+            note(f"TPORT could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        if added:
+            _Progress.post_hooks.append(name)
+        note(f"TPORT hook {name}: {'added' if added else 'refused'}")
 
     for name in MOVEFLAG_FUNCS:
         try:
@@ -1041,7 +1113,7 @@ def enable() -> None:
 def disable() -> None:
     """Unhook everything this module registered, whenever and however it was registered."""
     for name in _Progress.post_hooks:
-        for identifier in (HUD_ID, SERVERMOVE_ID):
+        for identifier in (HUD_ID, SERVERMOVE_ID, TELEPORT_ID):
             try:
                 remove_hook(name, Type.POST, identifier)
             except Exception:  # noqa: BLE001, S110 - nothing to do if it was never added

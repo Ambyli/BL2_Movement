@@ -199,16 +199,60 @@ def _drive_remote_slide(
 
 class _Trust:
     reported: ClassVar[bool] = False
+    reported_miss: ClassVar[bool] = False
 
 
-def _claimed_location(args: unreal.WrappedStruct) -> Any:
-    """The position the client says it reached, whatever this ServerMove variant calls it."""
-    for field in ("ClientLoc", "ClientLocation", "InClientLoc"):
+class _ArgName:
+    """The argument each ServerMove variant carries the client position in, once discovered."""
+
+    resolved: ClassVar[dict[str, str | None]] = {}
+
+
+def _claimed_location(args: unreal.WrappedStruct, variant: str) -> Any:
+    """The position the client says it reached, whatever this ServerMove variant calls it.
+
+    Found by inspecting the argument struct rather than by guessing names. BL2 routes moves through
+    several ServerMove variants and they do not agree on what the field is called - guessing wrong
+    returns None, which is indistinguishable from "this player is not sliding", and cost a full test
+    cycle exactly that way. The resolved name is cached per variant and logged once.
+    """
+    if variant in _ArgName.resolved:
+        name = _ArgName.resolved[variant]
+        if name is None:
+            return None
         try:
-            return getattr(args, field)
-        except Exception:  # noqa: BLE001 - variant without this name
-            continue
-    return None
+            return getattr(args, name)
+        except Exception:  # noqa: BLE001
+            return None
+
+    found: str | None = None
+    names: list[str] = []
+    try:
+        for prop in args._type._properties():  # noqa: SLF001 - the only way to enumerate these
+            field = str(prop.Name)
+            names.append(field)
+            lowered = field.lower()
+            if "loc" not in lowered or "rot" in lowered:
+                continue
+            try:
+                value = getattr(args, field)
+                # A position, not a flag or an index: it has to have vector components.
+                _ = (value.X, value.Y, value.Z)
+            except Exception:  # noqa: BLE001 - not a vector, keep looking
+                continue
+            found = field
+            break
+    except Exception as ex:  # noqa: BLE001
+        dbg(f"TRUST arg scan failed on {variant}: {type(ex).__name__}: {ex}")
+
+    _ArgName.resolved[variant] = found
+    dbg(f"TRUST {variant} position arg={found} (args: {names})")
+    if found is None:
+        return None
+    try:
+        return getattr(args, found)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _trust_client_position(
@@ -251,14 +295,20 @@ def _trust_client_position(
     except Exception:  # noqa: BLE001
         return
 
+    matched = False
     for player in CLIENTS_SLIDE_STATES.copy():
         if (_pc := player()) is None:
             CLIENTS_SLIDE_STATES.pop(player)
             continue
         if _pc != pc or not CLIENTS_SLIDE_STATES[player].is_sliding:
             continue
+        matched = True
 
-        if (claimed := _claimed_location(args)) is None:
+        try:
+            variant = str(_func.func.Name)
+        except Exception:  # noqa: BLE001
+            variant = "?"
+        if (claimed := _claimed_location(args, variant)) is None:
             return
         try:
             here = pawn.Location
@@ -275,6 +325,29 @@ def _trust_client_position(
             _Trust.reported = True
             dbg(f"TRUST live: closed a {gap:.0f} unit gap on the first adopted move")
         return
+
+    # Not matched. Both this and the host side correction blocking depend on finding the caller in
+    # the slide dict, and both have been silently finding nothing - so say who was actually looked
+    # for and who was on file, rather than leaving a miss indistinguishable from an idle frame.
+    if not matched and not _Trust.reported_miss:
+        _Trust.reported_miss = True
+        try:
+            who = str(pc.PlayerReplicationInfo.PlayerName)
+        except Exception:  # noqa: BLE001
+            who = "?"
+        on_file = []
+        for player in CLIENTS_SLIDE_STATES.copy():
+            if (_pc := player()) is None:
+                continue
+            try:
+                on_file.append(
+                    f"{_pc.PlayerReplicationInfo.PlayerName}"
+                    f"/sliding={CLIENTS_SLIDE_STATES[player].is_sliding}"
+                    f"/same={_pc == pc}",
+                )
+            except Exception:  # noqa: BLE001
+                on_file.append("?")
+        dbg(f"TRUST MISS servermove_for={who} on_file={on_file}")
 
 
 def enable_move_flags() -> None:
