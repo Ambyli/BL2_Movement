@@ -26,7 +26,7 @@ from mods_base import ENGINE
 from unrealsdk import construct_object, find_all
 from unrealsdk.hooks import Type, add_hook, remove_hook
 
-from .debug import dbg
+from .debug import dbg, stamp
 from .state import OWN_SLIDE_STATE, is_client, world_time
 
 if TYPE_CHECKING:
@@ -222,13 +222,19 @@ class _Progress:
 
 
 def note(msg: str) -> None:
-    """Append one line to the discovery log. Never raises at a call site."""
+    """Append one line to the discovery log. Never raises at a call site.
+
+    Shares `debug.stamp` rather than formatting its own prefix: the whole value of the timestamp is
+    reading this file against `bl2_slide_debug.log` from the same run, and against the other
+    machine's copy of both. Two writers that format time even slightly differently would cost
+    exactly the comparison the stamp exists for.
+    """
     if not DISCOVERY or _Progress.notes >= MAX_NOTES:
         return
     _Progress.notes += 1
     try:
         with DISCOVERY_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(f"{msg}\n")
+            handle.write(f"{stamp()}{msg}\n")
     except OSError:
         pass
 
@@ -1202,6 +1208,31 @@ def _accel_of(pc: Any) -> tuple[float, float] | None:
         return None
 
 
+def _forced_heading() -> tuple[float, float] | None:
+    """The heading `apply_slide_physics` is forcing RIGHT NOW, not the one locked at entry.
+
+    These are different values and the difference is the whole question. `dir_x/dir_y` is steered
+    every frame toward the player's input and then clamped to the turn cone, so it drifts away from
+    the entry heading during a slide. Logging only the entry snapshot made it impossible to tell a
+    slide whose heading we steered wrong from a slide whose heading was right and got overruled.
+    """
+    return _unit(OWN_SLIDE_STATE.dir_x, OWN_SLIDE_STATE.dir_y)
+
+
+def _velocity_heading(pc: Any) -> tuple[tuple[float, float] | None, float]:
+    """The pawn's actual velocity heading and speed, as the engine currently holds it.
+
+    Sampled on PlayerTick, which is after our POST PlayerMove write - so if this disagrees with
+    `_forced_heading`, something overwrote the velocity we set between the two.
+    """
+    try:
+        velocity = pc.Pawn.Velocity
+        vx, vy = float(velocity.X), float(velocity.Y)
+    except Exception:  # noqa: BLE001 - no pawn this frame
+        return (None, 0.0)
+    return (_unit(vx, vy), (vx * vx + vy * vy) ** 0.5)
+
+
 def _bearing_from_entry(here: tuple[float, float, float]) -> tuple[tuple[float, float] | None, float]:
     """Net travel from where the slide opened: its bearing, and how far. (None, d) below the floor."""
     entry = _Progress.path_entry
@@ -1238,12 +1269,19 @@ def _path_trace(
         return
 
     bearing, travelled = _bearing_from_entry(here)
+    vel_heading, speed = _velocity_heading(obj)
     _Progress.path_reports += 1
+    # The full causal chain on one line, in the order the direction actually travels through the
+    # code: entry -> what we force now -> what the pawn's velocity is -> where the pawn really went.
+    # Whichever pair first disagrees is where the direction is being lost, and that is the answer.
     note(
         f"PATH #{_Progress.path_reports} f+{_Progress.path_frames}"
         f" at=({here[0]:.0f},{here[1]:.0f},{here[2]:.0f})"
-        f" moved={travelled:.0f} went={_fmt(bearing)}"
+        f" moved={travelled:.0f}"
         f" locked={_fmt(_Progress.path_entry_dir)}"
+        f" forced={_fmt(_forced_heading())}"
+        f" vel={_fmt(vel_heading)}@{speed:.0f}"
+        f" went={_fmt(bearing)}"
         f" facing={_fmt(_facing_of(obj))}"
         f" accel={_fmt(_accel_of(obj))}",
     )
@@ -1325,10 +1363,19 @@ def _end_path(pc: WillowPlayerController) -> None:
     except Exception:  # noqa: BLE001 - no pawn
         return
     bearing, travelled = _bearing_from_entry(here)
+    forced = _forced_heading()
+    # `forced_vs_locked` is the new one that matters: how far our own steering walked the heading
+    # away from where the slide opened. Large here means we steered it - the turn cone and steer
+    # rate are the suspects. Small here while `went_vs_locked` is large means we held the heading
+    # correctly and something downstream moved the pawn anyway.
     note(
-        f"PATH close moved={travelled:.0f} went={_fmt(bearing)}"
+        f"PATH close moved={travelled:.0f}"
         f" locked={_fmt(_Progress.path_entry_dir)}"
+        f" forced={_fmt(forced)}"
+        f" went={_fmt(bearing)}"
         f" facing={_fmt(_Progress.path_entry_facing)}"
+        f" forced_vs_locked={_angle_between(forced, _Progress.path_entry_dir)}"
+        f" went_vs_forced={_angle_between(bearing, forced)}"
         f" went_vs_locked={_angle_between(bearing, _Progress.path_entry_dir)}"
         f" went_vs_facing={_angle_between(bearing, _Progress.path_entry_facing)}",
     )
