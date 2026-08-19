@@ -4,11 +4,42 @@ The feel dials are mod-menu sliders rather than constants, so they can be tuned 
 restart - recompiling this mod means quitting to desktop and reloading a save, which is by far the
 slowest part of working on it. Read these as `option.value` at the point of use; never cache them,
 or a slider change silently stops taking effect.
+
+Each slider fires `_on_slider_change` when the user drags it in the mod menu; that callback
+re-announces the full set to the host so a remote player's slide runs with their own tuned
+values rather than the host's defaults. The announce is idempotent and best-effort - a raise from
+the RPC path is swallowed rather than leaked back into the mod menu.
 """
 
 from __future__ import annotations
 
 from mods_base import GroupedOption, SliderOption
+
+
+def _on_slider_change(*_: object) -> None:
+    """Announce this machine's current slider values to the host.
+
+    Fires from every slider's `on_change`, so any dial the user tweaks triggers one announce with
+    the whole set - simpler than tracking which slider changed and sending only that field, and
+    the payload is five floats. The catchall `except` covers every case where an announce cannot
+    succeed right now (no world, not a client, network layer not initialised at mod load,
+    dedicated-server host with no host to address, etc.); in all of them the announce will be
+    resent from the top of `enter_slide` the next time the local player opens a slide, so a
+    dropped one here is not lost, just deferred.
+
+    Lazy imports to break the module cycle: `lifecycle` and `state` both import `config` at module
+    scope, so binding them here at module scope would import-cycle.
+    """
+    from .debug import log  # noqa: PLC0415 - deliberately lazy, see docstring
+    from .lifecycle import _announce_settings_to_host  # noqa: PLC0415
+    from .state import default_settings  # noqa: PLC0415
+
+    log.info("_on_slider_change enter")
+    try:
+        _announce_settings_to_host(default_settings())
+    except Exception as ex:  # noqa: BLE001 - a failed announce must never break the mod menu
+        log.warning(f"SLIDER ANNOUNCE FAILED {type(ex).__name__}: {ex}")
+    log.info("_on_slider_change exit")
 
 # Structural rather than feel dials, so they stay constants. SLIDE_SPEED_DEFAULT is where speed_pct
 # opens and the top of the decay range; CROUCHED_PCT_DEFAULT is both normal crouch speed and the
@@ -35,6 +66,7 @@ start_speed = SliderOption(
         " something read off the pawn, so aiming down sights, weapon swaps and class mods cannot"
         " change a slide already in progress."
     ),
+    on_change=_on_slider_change,
 )
 
 decay_rate = SliderOption(
@@ -48,6 +80,7 @@ decay_rate = SliderOption(
         "How fast a slide bleeds off, in speed units per second. Higher is a shorter slide. The"
         " slide runs from 2.2 down to 0.5, so 1.15 gives roughly a 1.5 second slide on the flat."
     ),
+    on_change=_on_slider_change,
 )
 
 max_duration = SliderOption(
@@ -61,6 +94,7 @@ max_duration = SliderOption(
         "Absolute cap on a single slide, in seconds. Downhill momentum can hold a slide at full"
         " speed indefinitely; this is the backstop that ends it regardless of terrain."
     ),
+    on_change=_on_slider_change,
 )
 
 steer_rate = SliderOption(
@@ -71,6 +105,7 @@ steer_rate = SliderOption(
     0.1,
     is_integer=False,
     description="How sharply the movement keys can curve a slide. 0 locks it dead straight.",
+    on_change=_on_slider_change,
 )
 
 max_turn_degrees = SliderOption(
@@ -84,6 +119,7 @@ max_turn_degrees = SliderOption(
         "Hard limit on how far a slide can turn from the heading it started on, so steering can"
         " never bring you round to travelling backwards."
     ),
+    on_change=_on_slider_change,
 )
 
 all_options = [

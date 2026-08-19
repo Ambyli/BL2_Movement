@@ -28,6 +28,25 @@ class State:
 
 
 @dataclass
+class PlayerSlideSettings:
+    """The five dials that shape a slide: start speed, decay curve, duration cap, steering rate
+    and turn cone.
+
+    Announced from every client to the host on slider change and again at slide open, so the host
+    can drive a remote player's slide with the numbers that player tuned to rather than its own.
+    Read from `PlayerSlideState` (where these values are snapshotted at slide open) rather than
+    live from config, so a mid-slide slider tweak takes effect on the next slide instead of
+    dragging the current one's math apart between the two machines.
+    """
+
+    start_speed: float
+    decay_rate: float
+    max_duration: float
+    steer_rate: float
+    max_turn_degrees: float
+
+
+@dataclass
 class PlayerSlideState:
     old_z: float
     is_sliding: bool
@@ -47,10 +66,14 @@ class PlayerSlideState:
     # Acceleration replication being fresh across a movement frame.
     input_x: float = 0.0
     input_y: float = 0.0
-    # Absolute speed, in unreal units, that the slide opened at. Captured at slide start rather than
-    # read live from `start_speed.value` in the physics, so the host uses the client's slider value
-    # for the client's slide instead of its own.
+    # Slider-driven physics dials, snapshotted at slide open from the owning machine's
+    # `PlayerSlideSettings`. Read from state during slide() and apply_slide_physics rather than
+    # live from config so a remote player's slide runs with their values, not the host's.
     start_speed: float = 0.0
+    decay_rate: float = 0.0
+    max_duration: float = 0.0
+    steer_rate: float = 0.0
+    max_turn_degrees: float = 0.0
 
 
 SLIDE_STATES: dict[int, PlayerSlideState] = {}
@@ -71,6 +94,53 @@ One stable object for the life of the session rather than a fresh one per slide:
 resets every field in place, and object identity is how the driver tells our own slide from a
 remote one without a second lookup.
 """
+
+PLAYER_SETTINGS: dict[int, PlayerSlideSettings] = {}
+"""Host-side cache of announced slider values, keyed by PlayerID.
+
+Populated by `server_announce_settings` and read by `server_enter_slide` when it opens the host's
+copy of a remote player's slide. Absent means that player has not announced yet (mod-load race, or
+they are the local player themselves) - the host falls back to `default_settings()` in that case
+so the slide still opens with reasonable numbers.
+
+Never cleaned up when a player leaves: leaves a stale entry per departed session, negligible next
+to a running slide's memory footprint, and avoids adding a leave hook that would need to run on
+the exact tick a player's controller becomes invalid to key by.
+"""
+
+
+def default_settings() -> PlayerSlideSettings:
+    """A fresh `PlayerSlideSettings` from this machine's current config sliders.
+
+    Used as both what the client announces to the host (its own current values) and as the host's
+    fallback when a remote player has not yet announced. Read `option.value` at call time rather
+    than caching, so a slider change is picked up on the next call without invalidation.
+
+    Lazy import for the config module: `state` is imported by `config`'s `on_change` path in the
+    other direction, so binding at module scope would cycle.
+    """
+    log.debug("default_settings enter")
+    from .config import (  # noqa: PLC0415 - deliberately lazy, see docstring
+        decay_rate,
+        max_duration,
+        max_turn_degrees,
+        start_speed,
+        steer_rate,
+    )
+
+    result = PlayerSlideSettings(
+        start_speed=start_speed.value,
+        decay_rate=decay_rate.value,
+        max_duration=max_duration.value,
+        steer_rate=steer_rate.value,
+        max_turn_degrees=max_turn_degrees.value,
+    )
+    log.debug(
+        f"default_settings exit start_speed={result.start_speed:.0f} decay={result.decay_rate:.3f}"
+        f" max_duration={result.max_duration:.2f} steer={result.steer_rate:.2f}"
+        f" max_turn={result.max_turn_degrees:.1f}",
+    )
+    return result
 
 e_net_mode: WorldInfo.ENetMode = cast("WorldInfo.ENetMode", find_enum("ENetMode"))
 
@@ -152,19 +222,25 @@ def begin_slide_state(
     slide_data: PlayerSlideState,
     dir_x: float,
     dir_y: float,
-    start_speed: float,
+    settings: PlayerSlideSettings,
 ) -> None:
-    """Open a slide on a known heading and start speed, resetting the curve it runs down.
+    """Open a slide on a known heading and slider settings, resetting the curve it runs down.
 
     Runs on: BOTH. The machine that owns the slide passes a heading sampled from its own pawn and
-    its own slider value; the host passes what arrived with the enter message, so the two agree by
-    construction rather than by each sampling its own copy of the pawn at a different moment.
+    its own settings; the host passes what arrived with the enter path (heading in the enter
+    message, dials from the announced `PLAYER_SETTINGS` cache), so the two agree by construction
+    rather than by each reading its own live config a frame apart.
 
     speed_pct, elapsed and input are reset because this state object outlives any one slide - left
-    alone, the previous slide's spent speed, elapsed time and last input would carry across.
+    alone, the previous slide's spent speed, elapsed time and last input would carry across. The
+    five slider values are snapshotted onto the state so mid-slide slider changes never drag the
+    running curve apart between the two machines - they take effect at the next slide, when
+    `begin_slide_state` is called again with fresh settings.
     """
     log.info(
-        f"begin_slide_state enter dir=({dir_x:.3f},{dir_y:.3f}) start_speed={start_speed:.0f}"
+        f"begin_slide_state enter dir=({dir_x:.3f},{dir_y:.3f}) start_speed={settings.start_speed:.0f}"
+        f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
+        f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}"
         f" prior_speed_pct={slide_data.speed_pct:.3f} prior_elapsed={slide_data.elapsed:.2f}",
     )
     slide_data.speed_pct = SLIDE_SPEED_DEFAULT
@@ -175,8 +251,15 @@ def begin_slide_state(
     slide_data.entry_y = dir_y
     slide_data.input_x = 0.0
     slide_data.input_y = 0.0
-    slide_data.start_speed = start_speed
+    slide_data.start_speed = settings.start_speed
+    slide_data.decay_rate = settings.decay_rate
+    slide_data.max_duration = settings.max_duration
+    slide_data.steer_rate = settings.steer_rate
+    slide_data.max_turn_degrees = settings.max_turn_degrees
     log.info(
-        f"begin_slide_state exit speed_pct={slide_data.speed_pct:.3f} entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"
-        f" start_speed={slide_data.start_speed:.0f}",
+        f"begin_slide_state exit speed_pct={slide_data.speed_pct:.3f}"
+        f" entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"
+        f" start_speed={slide_data.start_speed:.0f} decay={slide_data.decay_rate:.3f}"
+        f" max_duration={slide_data.max_duration:.2f} steer={slide_data.steer_rate:.2f}"
+        f" max_turn={slide_data.max_turn_degrees:.1f}",
     )

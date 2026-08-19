@@ -12,10 +12,6 @@ from .config import (
     SLIDE_BACK_CUTOFF,
     SLIDE_SPEED_DEFAULT,
     SLIDE_STEER_DEADZONE,
-    decay_rate,
-    max_duration,
-    max_turn_degrees,
-    steer_rate,
 )
 from .debug import every_n, log
 from .state import PlayerSlideState
@@ -88,14 +84,16 @@ def slide(
     if verbose:
         log.debug(
             f"slide enter speed_pct={slide_data.speed_pct:.3f} elapsed={slide_data.elapsed:.2f}"
-            f" delta={delta_time:.4f} z={pawn.Location.Z:.2f} old_z={slide_data.old_z:.2f}",
+            f" delta={delta_time:.4f} z={pawn.Location.Z:.2f} old_z={slide_data.old_z:.2f}"
+            f" decay={slide_data.decay_rate:.3f} max_duration={slide_data.max_duration:.2f}",
         )
     # Height difference against last frame, in unreal units.
     z_diff: float = pawn.Location.Z - slide_data.old_z
 
     # Time decay applies on every frame; a slope only offsets it, and has to be genuinely steep to
-    # offset it fully.
-    speed = slide_data.speed_pct - delta_time * decay_rate.value
+    # offset it fully. Read the decay rate off the state (captured at slide open from the owning
+    # player's settings) rather than live from config, so the host runs the client's curve.
+    speed = slide_data.speed_pct - delta_time * slide_data.decay_rate
     if z_diff < 0:
         speed -= z_diff * 0.0005  # downhill, wins some speed back
         slope = "downhill"
@@ -105,7 +103,7 @@ def slide(
     if verbose:
         log.debug(
             f"slide calc z_diff={z_diff:.2f} slope={slope} raw_speed={speed:.3f}"
-            f" decay_rate={decay_rate.value:.3f}",
+            f" decay_rate={slide_data.decay_rate:.3f}",
         )
 
     # A slope may sustain a slide, but never push it past the speed it opened at.
@@ -117,12 +115,15 @@ def slide(
     slide_data.speed_pct = speed
     slide_data.elapsed += delta_time
 
-    # Exit verdict: the decay bled below the walking-crouch floor, or the duration cap hit.
-    spent = speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= max_duration.value
+    # Exit verdict: the decay bled below the walking-crouch floor, or the duration cap hit. Both
+    # cutoffs come from state so a remote player's slide ends when their settings say it should,
+    # not when the host's settings would.
+    spent = speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= slide_data.max_duration
     if verbose:
         log.debug(
             f"slide exit speed_pct={speed:.3f} elapsed={slide_data.elapsed:.2f}"
-            f" spent={spent} cutoff={CROUCHED_PCT_DEFAULT:.3f} max_duration={max_duration.value:.2f}",
+            f" spent={spent} cutoff={CROUCHED_PCT_DEFAULT:.3f}"
+            f" max_duration={slide_data.max_duration:.2f}",
         )
     return spent
 
@@ -178,11 +179,15 @@ def apply_slide_physics(
                 accel = accel - direction * backwards
             strength = accel.magnitude
             if strength > SLIDE_STEER_DEADZONE:
-                alpha = min(steer_rate.value * delta_time * strength, 1.0)
+                # Steer rate and turn cone come from state (snapshotted at slide open from the
+                # owning player's settings), not live config, so the host steers the client's
+                # slide at the client's rate.
+                alpha = min(slide_data.steer_rate * delta_time * strength, 1.0)
                 direction = direction.lerp(accel.normalize(), alpha).normalize()
                 if verbose:
                     log.debug(
                         f"apply_slide_physics steer strength={strength:.3f} alpha={alpha:.3f}"
+                        f" steer_rate={slide_data.steer_rate:.2f}"
                         f" new_dir=({direction.x:.3f},{direction.y:.3f})",
                     )
 
@@ -190,7 +195,7 @@ def apply_slide_physics(
     # fed in. Anything past the limit is pinned to the edge of the allowed cone.
     entry = Vector((slide_data.entry_x, slide_data.entry_y, 0.0))
     if entry.magnitude > 0:
-        cos_limit = math.cos(math.radians(max_turn_degrees.value))
+        cos_limit = math.cos(math.radians(slide_data.max_turn_degrees))
         along = direction.dot(entry)
         if along < cos_limit:
             perp = direction - entry * along

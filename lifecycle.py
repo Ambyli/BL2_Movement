@@ -25,14 +25,17 @@ from uemath import Vector
 from unrealsdk.unreal import WeakPointer
 
 from . import events
-from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT, max_duration, start_speed
+from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT
 from .debug import every_n, log
 from .movement import apply_slide_physics, can_slide, slide
 from .state import (
     OWN_SLIDE_STATE,
+    PLAYER_SETTINGS,
     SLIDE_STATES,
+    PlayerSlideSettings,
     PlayerSlideState,
     begin_slide_state,
+    default_settings,
     heading_from,
     is_client,
     player_id,
@@ -181,7 +184,7 @@ def _log_slide_snapshot(
     else:
         turn_deg = 0.0
     forced_speed = state.start_speed * (state.speed_pct / SLIDE_SPEED_DEFAULT)
-    progress = state.elapsed / max_duration.value if max_duration.value > 0 else 0.0
+    progress = state.elapsed / state.max_duration if state.max_duration > 0 else 0.0
     log.debug(
         f"SLIDE_TICK who={player_id(pc)}"
         f" pos=({pawn.Location.X:.0f},{pawn.Location.Y:.0f},{pawn.Location.Z:.0f})"
@@ -190,7 +193,7 @@ def _log_slide_snapshot(
         f" input=({state.input_x:.2f},{state.input_y:.2f})"
         f" speed_forced={forced_speed:.0f} speed_actual={pre_speed:.0f}"
         f" pct={state.speed_pct:.3f}"
-        f" elapsed={state.elapsed:.2f}/{max_duration.value:.2f} progress={progress * 100:.0f}%"
+        f" elapsed={state.elapsed:.2f}/{state.max_duration:.2f} progress={progress * 100:.0f}%"
         f" ground={pawn.IsOnGroundOrShortFall()} crouched_pct={pawn.CrouchedPct:.3f}"
         f" delta={delta_time:.4f}",
     )
@@ -262,19 +265,22 @@ def begin_slide(
     pc: WillowPlayerController,
     dir_x: float,
     dir_y: float,
-    speed: float,
+    settings: PlayerSlideSettings,
     state: PlayerSlideState | None = None,
 ) -> bool:
     """Start driving a slide for this player on this machine. Idempotent.
 
     Runs on: BOTH - the owning machine calls it from `enter_slide` with its own state object and
-    its own slider value, and the host calls it from the enter message for every other player,
-    passing the heading and start speed that arrived with the message.
+    its own settings, and the host calls it from the enter message for every other player, using
+    the heading that arrived with the message and the settings previously announced by that
+    client (or defaults if none announced).
 
     Returns True if this call was the one that started it.
     """
     log.info(
-        f"begin_slide enter dir=({dir_x:.3f},{dir_y:.3f}) speed={speed:.0f}"
+        f"begin_slide enter dir=({dir_x:.3f},{dir_y:.3f}) start_speed={settings.start_speed:.0f}"
+        f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
+        f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}"
         f" have_state={state is not None} live_slides={len(SLIDE_STATES)}",
     )
     if (player := player_id(pc)) is None or (pawn := cast("WillowPlayerPawn", pc.Pawn)) is None:
@@ -293,7 +299,7 @@ def begin_slide(
         state.old_z = pawn.Location.Z
         state.is_sliding = True
         log.info(f"begin_slide reused own state old_z={pawn.Location.Z:.2f}")
-    begin_slide_state(state, dir_x, dir_y, speed)
+    begin_slide_state(state, dir_x, dir_y, settings)
     SLIDE_STATES[player] = state
 
     # Boost the replicated crouch multiplier so the speed cap is clear of the forced slide speed
@@ -314,49 +320,129 @@ def enter_slide(pc: WillowPlayerController) -> None:
         log.info("enter_slide exit reason=no_pawn")
         return
     dir_x, dir_y = heading_from(pawn)
-    speed = start_speed.value
+    settings = default_settings()
+
+    # Announce our settings before the enter RPC. RPC ordering from a single sender is preserved,
+    # so the host will process this first and its `server_enter_slide` will find fresh values in
+    # PLAYER_SETTINGS when it runs. Also covers the case where the on_change handler has never
+    # fired (fresh session, no slider changes yet, no announce sent).
+    try:
+        _announce_settings_to_host(settings)
+    except Exception as ex:  # noqa: BLE001 - the slide is more important than a settings sync
+        log.warning(f"ANNOUNCE SEND FAILED {type(ex).__name__}: {ex}")
+
     # Register locally before sending, so the slide never depends on the message for anything. On a
     # listen server the message below comes back to us a tick later and has to find this entry
     # already present, or it would start a second driver against the same pawn. And if the send
     # fails, our own slide is already running by then, so the cost is a host that never hears about
     # it rather than a slide that never happens.
-    if not begin_slide(pc, dir_x, dir_y, speed, OWN_SLIDE_STATE):
+    if not begin_slide(pc, dir_x, dir_y, settings, OWN_SLIDE_STATE):
         log.info("enter_slide exit reason=begin_slide_declined")
         return
     log.info(
-        f"ENTER client={is_client()} speed={speed:.0f}"
+        f"ENTER client={is_client()} speed={settings.start_speed:.0f}"
         f" dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}",
     )
     events.fire(events.slide_started, pc)
     try:
-        server_enter_slide(dir_x, dir_y, speed)
+        server_enter_slide(dir_x, dir_y)
     except Exception as ex:  # noqa: BLE001 - our slide is already running; only the host misses out
         log.warning(f"ENTER SEND FAILED {type(ex).__name__}: {ex}")
     log.info("enter_slide exit reason=started")
 
 
+def _announce_settings_to_host(settings: PlayerSlideSettings) -> None:
+    """Wrap the announce RPC so both call sites (enter_slide, config on_change) share one path.
+
+    Pulled out because the on_change hook in `config` needs a callable that will not raise into
+    the mods_base slider bookkeeping if the game has no world yet - the try/except lives at each
+    call site, but the message-building lives here so it is not duplicated.
+    """
+    log.info(
+        f"_announce_settings_to_host enter start_speed={settings.start_speed:.0f}"
+        f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
+        f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}",
+    )
+    server_announce_settings(
+        settings.start_speed,
+        settings.decay_rate,
+        settings.max_duration,
+        settings.steer_rate,
+        settings.max_turn_degrees,
+    )
+    log.info("_announce_settings_to_host exit")
+
+
 @host.json_message
-def server_enter_slide(dir_x: float, dir_y: float, speed: float) -> None:
-    """Start the host's copy of a player's slide, on the heading and speed they opened it on.
+def server_announce_settings(
+    start_speed_v: float,
+    decay_rate_v: float,
+    max_duration_v: float,
+    steer_rate_v: float,
+    max_turn_degrees_v: float,
+) -> None:
+    """Cache the sender's five slider values on the host, keyed by their PlayerID.
+
+    Runs on: HOST only. Fired by every client whenever its own sliders change, and once by every
+    client at the top of `enter_slide` so the host has fresh values before the enter RPC arrives.
+
+    Never touches a slide already in progress: the values that shape the current slide were
+    snapshotted onto its `PlayerSlideState` at open time on both machines, and updating them
+    retroactively on the host alone would drift the two simulations. A mid-slide slider change
+    therefore takes effect at the sender's next slide, not this one.
+    """
+    log.info(
+        f"server_announce_settings enter start_speed={start_speed_v:.0f}"
+        f" decay={decay_rate_v:.3f} max_duration={max_duration_v:.2f}"
+        f" steer={steer_rate_v:.2f} max_turn={max_turn_degrees_v:.1f}",
+    )
+    pc = cast("WillowPlayerController", server_announce_settings.sender.Owner)
+    if pc is None or (player := player_id(pc)) is None:
+        log.info(f"server_announce_settings exit reason=no_player has_pc={pc is not None}")
+        return
+    PLAYER_SETTINGS[player] = PlayerSlideSettings(
+        start_speed=start_speed_v,
+        decay_rate=decay_rate_v,
+        max_duration=max_duration_v,
+        steer_rate=steer_rate_v,
+        max_turn_degrees=max_turn_degrees_v,
+    )
+    log.info(
+        f"server_announce_settings exit stored player={player} known_players={len(PLAYER_SETTINGS)}",
+    )
+
+
+@host.json_message
+def server_enter_slide(dir_x: float, dir_y: float) -> None:
+    """Start the host's copy of a player's slide, on the heading they opened it on.
 
     Runs on: HOST only - `host` addresses the message there and nowhere else, so no net-mode guard
     is needed in the body.
 
-    Heading and start speed travel with the message rather than being resampled or re-read from the
-    host's own slider here. The host's copy of a remote pawn's velocity is whatever its own
-    simulation last produced (by the time this arrives, neither the client's heading nor
-    necessarily above the floor `heading_from` needs), and the host's slider value is its own -
-    neither is what the client just opened the slide on.
+    Heading travels with the message; the five physics dials come from `PLAYER_SETTINGS`, populated
+    by `server_announce_settings` before this arrives. If the announce never landed (a fresh
+    connection where the client's on_change never fired and its enter-time announce was dropped),
+    `default_settings()` is used instead so the slide still opens with reasonable numbers.
+
+    The host's copy of a remote pawn's velocity is whatever its own simulation last produced by
+    the time this arrives, so `heading_from` cannot be re-run here and the heading has to travel
+    with the message.
     """
-    log.info(f"server_enter_slide enter dir=({dir_x:.3f},{dir_y:.3f}) speed={speed:.0f}")
+    log.info(f"server_enter_slide enter dir=({dir_x:.3f},{dir_y:.3f})")
     pc = cast("WillowPlayerController", server_enter_slide.sender.Owner)
-    if pc is None:
-        log.info("server_enter_slide exit reason=no_sender_owner")
+    if pc is None or (player := player_id(pc)) is None:
+        log.info(f"server_enter_slide exit reason=no_player has_pc={pc is not None}")
         return
-    started = begin_slide(pc, dir_x, dir_y, speed)
+    settings = PLAYER_SETTINGS.get(player)
+    if settings is None:
+        log.info(f"server_enter_slide fallback player={player} reason=no_announce_yet")
+        settings = default_settings()
+    else:
+        log.info(f"server_enter_slide using announced settings player={player}")
+    started = begin_slide(pc, dir_x, dir_y, settings)
     if started:
         log.info(
-            f"SLIDE_ON who={player_id(pc)} speed={speed:.0f}"
+            f"SLIDE_ON who={player} start_speed={settings.start_speed:.0f}"
             f" dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}",
         )
     log.info(f"server_enter_slide exit started={started}")
@@ -435,6 +521,7 @@ def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
 # Passed explicitly to add_network_functions: it only scans the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
 network_functions = [
+    server_announce_settings,
     server_enter_slide,
     server_exit_slide,
     server_slide_input,
