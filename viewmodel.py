@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 from tweens import Tween, circ_out, cubic_in_out, cubic_out, elastic_out, quad_out
 
+from .debug import log
+
 if TYPE_CHECKING:
     from common import WillowPlayerController
 
@@ -25,14 +27,17 @@ def on_start(pc: WillowPlayerController) -> None:
     and lives only on the owning client; on other machines this pawn has no Arms attachment and
     the early-return below catches that. Subscribed to `events.slide_started` in __init__.
     """
+    log.info(f"viewmodel.on_start enter pc={pc} tween_running={_View.tweener.is_running()}")
     # Kill any tween still running from an interrupted previous slide - a slide that ends before
     # the pose animation finishes would otherwise leave overlapping tweens fighting each other.
     if _View.tweener.is_running():
         _View.tweener.kill()
+        log.info("viewmodel.on_start killed prior tween")
     # Third-person pawns have no Arms mesh; on those, this callback is a no-op. Only the owning
     # client sees its own first-person arms.
     arms = pc.Pawn.Arms
     if not arms.Attachments:
+        log.info("viewmodel.on_start exit reason=no_arms_attachments")
         return
     # Build a fresh parallel tween. Each tween_property call adds one channel; set_parallel(True)
     # below makes them all animate concurrently rather than sequentially.
@@ -76,6 +81,7 @@ def on_start(pc: WillowPlayerController) -> None:
     ).from_current().transition(circ_out)
     t.set_parallel(True)
     t.start()
+    log.info("viewmodel.on_start exit reason=started_slide_in_tween")
 
 
 def on_end(pc: WillowPlayerController) -> None:
@@ -83,13 +89,16 @@ def on_end(pc: WillowPlayerController) -> None:
 
     Runs on: LOCAL MACHINE only. Subscribed to `events.slide_ended` in __init__.
     """
+    log.info(f"viewmodel.on_end enter pc={pc} tween_running={_View.tweener.is_running()}")
     # Kill the slide-in tween if it's still running - we want to hand off cleanly to the
     # settle-out animation rather than have both interpolators writing to the same channels.
     if _View.tweener.is_running():
         _View.tweener.kill()
+        log.info("viewmodel.on_end killed prior tween")
     # Same third-person guard as on_start: nothing to animate if this pawn has no Arms mesh.
     arms = pc.Pawn.Arms
     if not arms.Attachments:
+        log.info("viewmodel.on_end exit reason=no_arms_attachments")
         return
     # New parallel tween, this time interpolating everything back to its resting pose.
     _View.tweener = Tween()
@@ -132,3 +141,4 @@ def on_end(pc: WillowPlayerController) -> None:
     ).from_current().transition(circ_out)
     t.set_parallel(True)
     t.start()
+    log.info("viewmodel.on_end exit reason=started_settle_out_tween")

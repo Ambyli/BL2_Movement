@@ -12,6 +12,7 @@ from networking import add_network_functions
 
 from . import discovery, events, viewmodel
 from .config import all_options
+from .debug import log
 from .hooks import all_hooks
 from .lifecycle import network_functions
 
@@ -28,11 +29,15 @@ events.slide_ended.append(discovery.on_end)
 
 
 def _on_enable() -> None:
+    log.info("_on_enable enter")
     discovery.enable()
+    log.info("_on_enable exit")
 
 
 def _on_disable() -> None:
+    log.info("_on_disable enter")
     discovery.disable()
+    log.info("_on_disable exit")
 
 
 # Both of these only scan the calling module's scope, so the lists have to be handed over

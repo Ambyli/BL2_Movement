@@ -14,6 +14,7 @@ from uemath import Vector
 from unrealsdk import find_enum
 
 from .config import SLIDE_SPEED_DEFAULT
+from .debug import log
 
 if TYPE_CHECKING:
     from common import WillowGameEngine, WillowPlayerController, WillowPlayerPawn, WorldInfo
@@ -80,7 +81,10 @@ def is_client() -> bool:
     NM_Client means "we are a client connected to a remote host"; NM_Standalone / NM_ListenServer
     both return False here, so single-player and listen-server-host both count as the host.
     """
-    return cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().NetMode == e_net_mode.NM_Client
+    log.debug("is_client enter")
+    result = cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().NetMode == e_net_mode.NM_Client
+    log.debug(f"is_client exit result={result}")
+    return result
 
 
 def world_time() -> float:
@@ -88,6 +92,9 @@ def world_time() -> float:
 
     Every machine has its own; comparisons only mean anything against values captured earlier on
     the same machine.
+
+    Deliberately unlogged: the log formatter reads world time on every record, so any log call
+    here would recurse into the formatter.
     """
     return float(cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().TimeSeconds)
 
@@ -98,17 +105,28 @@ def player_id(pc: WillowPlayerController) -> int | None:
     `getattr` rather than attribute access because callers hand this whatever controller they have,
     including AI ones that carry no PlayerReplicationInfo at all.
     """
+    log.debug(f"player_id enter pc={pc}")
     if (pri := getattr(pc, "PlayerReplicationInfo", None)) is None:
+        log.debug("player_id exit result=None reason=no_pri")
         return None
-    return int(pri.PlayerID)
+    result = int(pri.PlayerID)
+    log.debug(f"player_id exit result={result}")
+    return result
 
 
 def state_for(pc: WillowPlayerController) -> PlayerSlideState | None:
     """The live slide governing this controller, or None if it is not sliding."""
+    log.debug(f"state_for enter pc={pc}")
     if (player := player_id(pc)) is None:
+        log.debug("state_for exit result=None reason=no_player_id")
         return None
     state = SLIDE_STATES.get(player)
-    return state if state is not None and state.is_sliding else None
+    result = state if state is not None and state.is_sliding else None
+    log.debug(
+        f"state_for exit player={player} has_entry={state is not None}"
+        f" is_sliding={state.is_sliding if state is not None else False} result={result}",
+    )
+    return result
 
 
 def heading_from(pawn: WillowPlayerPawn) -> tuple[float, float]:
@@ -118,11 +136,15 @@ def heading_from(pawn: WillowPlayerPawn) -> tuple[float, float]:
     effectively stationary - opened from a jump landing, say - which leaves the slide with no
     heading to force and makes `apply_slide_physics` a no-op until one arrives.
     """
+    log.debug(f"heading_from enter pawn.Velocity=({pawn.Velocity.X:.2f},{pawn.Velocity.Y:.2f},{pawn.Velocity.Z:.2f})")
     vel = Vector(pawn.Velocity)
     vel.z = 0
     if vel.magnitude < 1.0:
+        log.debug(f"heading_from exit result=(0.00,0.00) reason=magnitude={vel.magnitude:.3f}<1.0")
         return 0.0, 0.0
+    log.debug(f"heading_from calc pre_norm_magnitude={vel.magnitude:.2f}")
     vel.normalize()
+    log.debug(f"heading_from exit result=({vel.x:.3f},{vel.y:.3f})")
     return vel.x, vel.y
 
 
@@ -141,6 +163,10 @@ def begin_slide_state(
     speed_pct, elapsed and input are reset because this state object outlives any one slide - left
     alone, the previous slide's spent speed, elapsed time and last input would carry across.
     """
+    log.info(
+        f"begin_slide_state enter dir=({dir_x:.3f},{dir_y:.3f}) start_speed={start_speed:.0f}"
+        f" prior_speed_pct={slide_data.speed_pct:.3f} prior_elapsed={slide_data.elapsed:.2f}",
+    )
     slide_data.speed_pct = SLIDE_SPEED_DEFAULT
     slide_data.elapsed = 0.0
     slide_data.dir_x = dir_x
@@ -150,3 +176,7 @@ def begin_slide_state(
     slide_data.input_x = 0.0
     slide_data.input_y = 0.0
     slide_data.start_speed = start_speed
+    log.info(
+        f"begin_slide_state exit speed_pct={slide_data.speed_pct:.3f} entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"
+        f" start_speed={slide_data.start_speed:.0f}",
+    )

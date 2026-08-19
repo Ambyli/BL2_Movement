@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .debug import dbg
+from .debug import log
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -34,10 +34,17 @@ def fire(callbacks: Iterable[SlideCallback], pc: WillowPlayerController) -> None
     """
     # Iterate a snapshot copy so a subscriber that mutates the subscription list mid-fire (e.g.
     # unsubscribing itself) does not corrupt the loop.
-    for callback in list(callbacks):
+    snapshot = list(callbacks)
+    log.info(f"fire enter n_callbacks={len(snapshot)} pc={pc}")
+    dispatched = 0
+    for callback in snapshot:
+        name = getattr(callback, "__qualname__", str(callback))
+        log.debug(f"fire dispatch callback={name}")
         try:
             callback(pc)
+            dispatched += 1
         except Exception as ex:  # noqa: BLE001 - isolation is the whole point
             # Log the failure with the callback name so we can tell which listener died. The rest
             # of the loop continues so one broken subscriber never blocks the others.
-            dbg(f"EVENT FAILED {getattr(callback, '__qualname__', callback)}: {type(ex).__name__}: {ex}")
+            log.warning(f"EVENT FAILED {name}: {type(ex).__name__}: {ex}")
+    log.info(f"fire exit dispatched={dispatched}/{len(snapshot)}")
