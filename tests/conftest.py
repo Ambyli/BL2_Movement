@@ -314,3 +314,11 @@ import tempfile  # noqa: E402
 from BL2_Movement import debug as _debug  # noqa: E402
 
 _debug.LOG_PATH = Path(tempfile.gettempdir()) / "bl2_slide_debug_tests.log"
+
+# `discovery` keeps its own two writers, and `discovery.enable()` *truncates* them. Importing it
+# here to redirect both is cheaper than discovering later that a test run wiped a co-op session's
+# evidence - that log is gathered one full game restart at a time.
+from BL2_Movement import discovery as _discovery  # noqa: E402
+
+_discovery.DISCOVERY_LOG = Path(tempfile.gettempdir()) / "bl2_discovery_tests.log"
+_discovery.AKEVENT_DUMP = Path(tempfile.gettempdir()) / "bl2_akevents_tests.txt"

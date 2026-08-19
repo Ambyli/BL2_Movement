@@ -42,6 +42,14 @@ class _Phys:
     """
 
     reported: ClassVar[bool] = False
+    applied: ClassVar[int] = 0
+    """How many times slide physics has been written onto the local pawn, by either path.
+
+    Read only by the replay probe in `discovery`. Bracketing a `ClientUpdatePosition` with this
+    counter answers whether our forcing runs during the correction replay: if it does not advance
+    across the call, the replayed moves were simulated as plain walking and the slide heading was
+    discarded. Goes when the diagnostics go.
+    """
     last_frame: ClassVar[float] = -1.0
     last_delta: ClassVar[float] = 0.0
     last_world_time: ClassVar[float] = -1.0
@@ -232,6 +240,7 @@ def enforce_slide(
     # rather than raise, so a bug in the physics can't take the whole movement path down with it.
     try:
         apply_slide_physics(pawn, OWN_SLIDE_STATE, delta_time)
+        _Phys.applied += 1
     except Exception as ex:  # noqa: BLE001 - never break the move path
         dbg(f"ENFORCE FAILED {type(ex).__name__}: {ex}")
 
@@ -378,6 +387,7 @@ def _phys_sliding(
         # integrated it, and it would otherwise write a second time after PlayerMove returns.
         if is_local:
             _Phys.mark_local_frame()
+            _Phys.applied += 1
         # Extra exit condition for remote pawns: their crouch released. The local player's copy of
         # this check lives in handle_move's can_slide gate.
         elif not bool(getattr(pc, "bDuck", False)):

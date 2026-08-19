@@ -18,6 +18,7 @@ bounded, because some of what is hooked here runs on every rendered frame.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -63,6 +64,10 @@ NETCODE_WORDS = (
     "moveautonomous",
     "ackgoodmove",
     "autonomousphysics",
+    # Added for the replay probe. Listing every match tells us the real name of the replay entry
+    # point instead of guessing it, which is a whole restart per wrong guess.
+    "updateposition",
+    "savedmove",
 )
 NETCODE_HOOK_WORDS = ("adjustposition", "setlocation", "moveautonomous")
 # Every variant the scan turned up. Hooking only the base one produced zero samples across a whole
@@ -113,6 +118,22 @@ TELEPORT_WATCH_FRAMES: int = 45
 TELEPORT_MIN_JUMP: float = 50.0
 MAX_TELEPORT_REPORTS: int = 12
 
+# The path tracer. The teleport watcher above answers "did we jump"; this answers "where were we
+# actually going". It samples the pawn's world position across the whole slide and reports the
+# bearing the player really travelled, next to the three headings that were supposed to determine
+# it: the heading the mod locked at entry, the direction the player was facing, and the acceleration
+# the host is being told about. If a slide always runs off along one fixed world bearing no matter
+# which way the player set off, these four columns say which of them the motion is actually
+# following - and if it follows none of them, that it is coming from somewhere else entirely.
+PATH_ID = "SlidingDiscoveryPath"
+PATH_FUNCS = ("Engine.PlayerController:PlayerTick",)
+PATH_SAMPLE_EVERY: int = 8
+"""Frames between samples. At ~140fps this is ~17 per slide - a readable curve, not a wall."""
+MAX_PATH_REPORTS: int = 90
+"""Roughly five slides' worth of samples. Bounded like everything else here."""
+PATH_MIN_TRAVEL: float = 5.0
+"""Below this much movement from entry, the bearing is noise rather than a direction."""
+
 MOVEFLAG_ID = "SlidingDiscoveryMoveFlags"
 MOVEFLAG_FUNCS = ("Engine.PlayerController:MoveAutonomous",)
 MAX_MOVEFLAG_FIRES: int = 40
@@ -136,6 +157,25 @@ MAX_TRANSPORT_FIRES: int = 30
 HUD_ID = "SlidingDiscoveryHud"
 FOOTSTEP_ID = "SlidingDiscoveryFootstep"
 NETCODE_ID = "SlidingDiscoveryNetcode"
+
+# The replay probe. When the server corrects a client, UE3 does not merely snap it - PlayerTick sees
+# bUpdatePosition and calls ClientUpdatePosition, which re-runs every unacknowledged SavedMove
+# through MoveAutonomous. That path never goes through PlayerWalking.PlayerMove, which is where
+# `hooks.enforce_slide` lives, so the replayed frames would be re-simulated as ordinary crouch
+# walking with the locked slide heading discarded. This brackets the call and measures exactly that:
+# whether `_Phys.applied` advances across it, and what the pawn's heading looks like on either side.
+#
+# ClientUpdatePosition is script in stock UE3, but so was PhysWalking by that reasoning and it has
+# never once dispatched - so the name is verified by the function scan rather than assumed, and the
+# probe logs a one-shot line the moment it actually fires. No line means it never ran.
+REPLAY_ID = "SlidingDiscoveryReplay"
+REPLAY_FUNCS = (
+    "Engine.PlayerController:ClientUpdatePosition",
+    "WillowGame.WillowPlayerController:ClientUpdatePosition",
+)
+MAX_REPLAY_REPORTS: int = 24
+MAX_SAVEDMOVE_WALK: int = 64
+"""Cap on how far down the SavedMoves linked list to walk. A corrupt NextMove must not hang a frame."""
 
 HUD_FUNCS = (
     "WillowGame.WillowHUD:PostRender",
@@ -166,6 +206,14 @@ class _Progress:
     watch_frames: ClassVar[int] = 0
     watch_last: ClassVar[tuple[float, float, float] | None] = None
     teleport_reports: ClassVar[int] = 0
+    path_entry: ClassVar[tuple[float, float, float] | None] = None
+    path_entry_facing: ClassVar[tuple[float, float] | None] = None
+    path_entry_dir: ClassVar[tuple[float, float] | None] = None
+    path_frames: ClassVar[int] = 0
+    path_reports: ClassVar[int] = 0
+    replay_fires: ClassVar[int] = 0
+    replay_reported: ClassVar[bool] = False
+    replay_pending: ClassVar[tuple[int, int, str] | None] = None
     last_fire_args: ClassVar[dict[str, str]] = {}
     dumped_surface_props: ClassVar[bool] = False
     hud_seen: ClassVar[set[str]] = set()
@@ -852,6 +900,134 @@ def _netcode_probe(
     )
 
 
+def _arg_field_names(args: Any) -> list[str]:
+    """Every parameter name on a hook's args struct. Mirrors `hooks._arg_names`, kept local so the
+    diagnostics module stays deletable in one piece."""
+    try:
+        return [str(field.Name) for field in args._type._fields()]
+    except Exception:  # noqa: BLE001 - a probe must never raise at its call site
+        try:
+            return [name for name in dir(args) if not name.startswith("_")]
+        except Exception:  # noqa: BLE001
+            return []
+
+
+def _velocity_summary(pc: Any) -> str:
+    """Speed and unit heading of the pawn, as `spd=891 hdg=(0.98,-0.21)`."""
+    try:
+        velocity = pc.Pawn.Velocity
+        vx, vy = float(velocity.X), float(velocity.Y)
+    except Exception:  # noqa: BLE001 - no pawn mid-transition
+        return "spd=? hdg=?"
+    speed = (vx * vx + vy * vy) ** 0.5
+    if speed < 1.0:
+        return f"spd={speed:.0f} hdg=(none)"
+    return f"spd={speed:.0f} hdg=({vx / speed:.2f},{vy / speed:.2f})"
+
+
+def _saved_move_count(pc: Any) -> str:
+    """How many unacknowledged moves are queued to be replayed.
+
+    UE3 keeps these as a linked list off `SavedMoves`, walked via `NextMove`. Capped, because a
+    diagnostic that walks a corrupt list forever costs the frame it was meant to describe.
+    """
+    try:
+        move = pc.SavedMoves
+    except Exception:  # noqa: BLE001 - variant without the property
+        return "?"
+    count = 0
+    try:
+        while move is not None and count < MAX_SAVEDMOVE_WALK:
+            count += 1
+            move = move.NextMove
+    except Exception:  # noqa: BLE001, S110 - end of list; the count so far is the answer
+        pass
+    return f"{count}{'+' if count >= MAX_SAVEDMOVE_WALK else ''}"
+
+
+def _applied_count() -> int:
+    """`hooks._Phys.applied` - how many times slide physics has been forced onto the local pawn.
+
+    Imported lazily. `discovery` is imported before `hooks` in `__init__`, and a module-level import
+    here would invert that order for no benefit.
+    """
+    try:
+        from .hooks import _Phys  # noqa: PLC0415 - deliberately lazy, see docstring
+
+        return int(_Phys.applied)
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def _replay_probe_pre(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """PRE ClientUpdatePosition: snapshot the state the replay is about to overwrite.
+
+    Runs on: the corrected machine, which is whichever one is a client.
+    """
+    # One-shot proof of life, before any filter can suppress it. If this line never appears, the
+    # replay hypothesis is dead on its face and the corrections are doing something else entirely.
+    if not _Progress.replay_reported:
+        _Progress.replay_reported = True
+        note(f"REPLAY fired args={_arg_field_names(args)} client={is_client()}")
+
+    if not OWN_SLIDE_STATE.is_sliding and _Progress.watch_frames <= 0:
+        return
+    _Progress.replay_fires += 1
+    if _Progress.replay_fires > MAX_REPLAY_REPORTS:
+        return
+    try:
+        # Stash the pre-replay reading for the POST half to diff against. The applied counter is the
+        # measurement that matters; the rest is context for reading the line.
+        _Progress.replay_pending = (
+            _Progress.replay_fires,
+            _applied_count(),
+            _velocity_summary(obj),
+        )
+        note(
+            f"REPLAY #{_Progress.replay_fires} pre sliding={OWN_SLIDE_STATE.is_sliding}"
+            f" moves={_saved_move_count(obj)} applied={_applied_count()}"
+            f" {_velocity_summary(obj)}"
+            f" slide_hdg=({OWN_SLIDE_STATE.dir_x:.2f},{OWN_SLIDE_STATE.dir_y:.2f})"
+            f" pct={OWN_SLIDE_STATE.speed_pct:.2f}",
+        )
+    except Exception as ex:  # noqa: BLE001 - never break the correction path
+        note(f"REPLAY pre failed: {type(ex).__name__}: {ex}")
+
+
+def _replay_probe_post(
+    obj: unreal.UObject,
+    _args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """POST ClientUpdatePosition: report what the replay did, and whether our forcing ran inside it.
+
+    `applied=N->N` is the finding: the replay re-simulated those moves without the slide, so the
+    locked heading was discarded and the pawn came out following raw input. `applied=N->N+k` would
+    kill the hypothesis - our physics would be running inside the replay after all.
+    """
+    pending = _Progress.replay_pending
+    if pending is None:
+        return
+    _Progress.replay_pending = None
+    index, applied_before, before = pending
+    try:
+        applied_after = _applied_count()
+        note(
+            f"REPLAY #{index} post applied={applied_before}->{applied_after}"
+            f" (forced {applied_after - applied_before}x during replay)"
+            f" before[{before}] after[{_velocity_summary(obj)}]"
+            f" slide_hdg=({OWN_SLIDE_STATE.dir_x:.2f},{OWN_SLIDE_STATE.dir_y:.2f})",
+        )
+    except Exception as ex:  # noqa: BLE001 - never break the correction path
+        note(f"REPLAY post failed: {type(ex).__name__}: {ex}")
+
+
 def _scan_functions() -> None:
     """Find the footstep and PostRender functions by searching, rather than by guessing names.
 
@@ -983,6 +1159,104 @@ def _hud_probe(
 # --- wiring ----------------------------------------------------------------------------------------
 
 
+def _unit(x: float, y: float) -> tuple[float, float] | None:
+    """Normalise a ground-plane vector, or None if it is too short to have a direction."""
+    magnitude = (x * x + y * y) ** 0.5
+    if magnitude < 1e-6:
+        return None
+    return (x / magnitude, y / magnitude)
+
+
+def _fmt(vec: tuple[float, float] | None) -> str:
+    """A unit vector as `(0.98,-0.21)`, or `(none)` when there was no direction to report."""
+    return "(none)" if vec is None else f"({vec[0]:.2f},{vec[1]:.2f})"
+
+
+def _facing_of(pc: Any) -> tuple[float, float] | None:
+    """The player's view direction as a ground-plane unit vector.
+
+    UE3 rotators are 16-bit: 65536 units to a full turn, not 360 degrees. Getting that conversion
+    wrong yields a plausible-looking vector that is silently wrong, which is worse here than no
+    reading at all - the whole question is whether the slide follows this vector or ignores it.
+    """
+    try:
+        yaw = float(pc.Rotation.Yaw)
+    except Exception:  # noqa: BLE001 - no controller rotation this frame
+        return None
+    radians = yaw * math.tau / 65536.0
+    return (math.cos(radians), math.sin(radians))
+
+
+def _accel_of(pc: Any) -> tuple[float, float] | None:
+    """The pawn's current acceleration as a unit vector - the only directional input the host gets.
+
+    Sampled at the end of the tick, which is after `apply_slide_physics` has zeroed it. That is
+    deliberate: if this reads `(none)` for the whole slide, the host is being handed a zero
+    acceleration and has nothing left to steer its copy of the pawn with, which would explain a
+    remote slide that goes somewhere unrelated to the player's input.
+    """
+    try:
+        accel = pc.Pawn.Acceleration
+        return _unit(float(accel.X), float(accel.Y))
+    except Exception:  # noqa: BLE001 - no pawn this frame
+        return None
+
+
+def _bearing_from_entry(here: tuple[float, float, float]) -> tuple[tuple[float, float] | None, float]:
+    """Net travel from where the slide opened: its bearing, and how far. (None, d) below the floor."""
+    entry = _Progress.path_entry
+    if entry is None:
+        return (None, 0.0)
+    dx, dy, dz = here[0] - entry[0], here[1] - entry[1], here[2] - entry[2]
+    travelled = (dx * dx + dy * dy + dz * dz) ** 0.5
+    if travelled < PATH_MIN_TRAVEL:
+        return (None, travelled)
+    return (_unit(dx, dy), travelled)
+
+
+def _path_trace(
+    obj: unreal.UObject,
+    _args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """POST PlayerTick: sample where we actually are, mid-slide.
+
+    Throttled and bounded. Reports the bearing actually travelled since entry alongside the mod's
+    locked heading, the player's facing, and the replicated acceleration, so the four can be read
+    off against each other on one line.
+    """
+    if not OWN_SLIDE_STATE.is_sliding or _Progress.path_reports >= MAX_PATH_REPORTS:
+        return
+    _Progress.path_frames += 1
+    if _Progress.path_frames % PATH_SAMPLE_EVERY != 0:
+        return
+    try:
+        location = obj.Pawn.Location
+        here = (float(location.X), float(location.Y), float(location.Z))
+    except Exception:  # noqa: BLE001 - no pawn this frame
+        return
+
+    bearing, travelled = _bearing_from_entry(here)
+    _Progress.path_reports += 1
+    note(
+        f"PATH #{_Progress.path_reports} f+{_Progress.path_frames}"
+        f" at=({here[0]:.0f},{here[1]:.0f},{here[2]:.0f})"
+        f" moved={travelled:.0f} went={_fmt(bearing)}"
+        f" locked={_fmt(_Progress.path_entry_dir)}"
+        f" facing={_fmt(_facing_of(obj))}"
+        f" accel={_fmt(_accel_of(obj))}",
+    )
+
+
+def _angle_between(a: tuple[float, float] | None, b: tuple[float, float] | None) -> str:
+    """Angle between two unit vectors in degrees, as a string. `?` when either is missing."""
+    if a is None or b is None:
+        return "?"
+    dot = max(-1.0, min(1.0, a[0] * b[0] + a[1] * b[1]))
+    return f"{math.degrees(math.acos(dot)):.0f}deg"
+
+
 def _teleport_watch(
     obj: unreal.UObject,
     _args: unreal.WrappedStruct,
@@ -1021,10 +1295,50 @@ def _teleport_watch(
     )
 
 
+def _begin_path(pc: WillowPlayerController) -> None:
+    """Stamp the reference frame every PATH line is measured against: where we were, which way we
+    were facing, and the heading the mod just locked.
+    """
+    _Progress.path_frames = 0
+    _Progress.path_entry_facing = _facing_of(pc)
+    _Progress.path_entry_dir = _unit(OWN_SLIDE_STATE.dir_x, OWN_SLIDE_STATE.dir_y)
+    try:
+        location = pc.Pawn.Location
+        _Progress.path_entry = (float(location.X), float(location.Y), float(location.Z))
+    except Exception:  # noqa: BLE001 - no pawn; the samples will report (none) and say so
+        _Progress.path_entry = None
+    note(
+        f"PATH open at={_Progress.path_entry} locked={_fmt(_Progress.path_entry_dir)}"
+        f" facing={_fmt(_Progress.path_entry_facing)}"
+        f" offset={_angle_between(_Progress.path_entry_dir, _Progress.path_entry_facing)}"
+        f" client={is_client()}",
+    )
+
+
+def _end_path(pc: WillowPlayerController) -> None:
+    """The line that answers the question: where did this slide actually go, and how far off was it
+    from both the heading it locked and the way the player was facing when they started it.
+    """
+    try:
+        location = pc.Pawn.Location
+        here = (float(location.X), float(location.Y), float(location.Z))
+    except Exception:  # noqa: BLE001 - no pawn
+        return
+    bearing, travelled = _bearing_from_entry(here)
+    note(
+        f"PATH close moved={travelled:.0f} went={_fmt(bearing)}"
+        f" locked={_fmt(_Progress.path_entry_dir)}"
+        f" facing={_fmt(_Progress.path_entry_facing)}"
+        f" went_vs_locked={_angle_between(bearing, _Progress.path_entry_dir)}"
+        f" went_vs_facing={_angle_between(bearing, _Progress.path_entry_facing)}",
+    )
+
+
 def on_end(pc: WillowPlayerController) -> None:
-    """Subscribed to `slide_ended`. Arms the teleport watcher for the next second or so."""
+    """Subscribed to `slide_ended`. Reports the path, then arms the teleport watcher."""
     if not DISCOVERY:
         return
+    _end_path(pc)
     _Progress.watch_frames = TELEPORT_WATCH_FRAMES
     try:
         location = pc.Pawn.Location
@@ -1037,6 +1351,7 @@ def on_start(pc: WillowPlayerController) -> None:
     """Subscribed to `slide_started`. Everything expensive here is one-shot or throttled."""
     if not DISCOVERY:
         return
+    _begin_path(pc)
     _dump_network_identity(pc)
     _dump_move_internals(pc)
     _probe_flag_layout(pc)
@@ -1072,6 +1387,16 @@ def enable() -> None:
         if added:
             _Progress.post_hooks.append(name)
         note(f"SMOVE hook {name}: {'added' if added else 'refused'}")
+
+    for name in PATH_FUNCS:
+        try:
+            added = add_hook(name, Type.POST, PATH_ID, _path_trace)
+        except Exception as ex:  # noqa: BLE001
+            note(f"PATH could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        if added:
+            _Progress.post_hooks.append(name)
+        note(f"PATH hook {name}: {'added' if added else 'refused'}")
 
     for name in TELEPORT_FUNCS:
         try:
@@ -1113,6 +1438,25 @@ def enable() -> None:
             _Progress.pre_hooks.append(name)
         note(f"XPORT hook {name}: {'added' if added else 'refused'}")
 
+    # Both halves of the replay bracket. PRE snapshots what the replay is about to overwrite, POST
+    # reports whether our forcing ran inside it. Registered by hand like everything else here -
+    # build_mod only gathers from __init__'s own scope, so a decorator would register nothing.
+    for name in REPLAY_FUNCS:
+        try:
+            added_pre = add_hook(name, Type.PRE, REPLAY_ID, _replay_probe_pre)
+            added_post = add_hook(name, Type.POST, REPLAY_ID, _replay_probe_post)
+        except Exception as ex:  # noqa: BLE001 - a missing variant is expected, not fatal
+            note(f"REPLAY could not hook {name}: {type(ex).__name__}: {ex}")
+            continue
+        if added_pre:
+            _Progress.pre_hooks.append(name)
+        if added_post:
+            _Progress.post_hooks.append(name)
+        note(
+            f"REPLAY hook {name}: pre={'added' if added_pre else 'refused'}"
+            f" post={'added' if added_post else 'refused'}",
+        )
+
     for name in HUD_FUNCS:
         try:
             added = add_hook(name, Type.POST, HUD_ID, _hud_probe)
@@ -1129,7 +1473,7 @@ def enable() -> None:
 def disable() -> None:
     """Unhook everything this module registered, whenever and however it was registered."""
     for name in _Progress.post_hooks:
-        for identifier in (HUD_ID, SERVERMOVE_ID, TELEPORT_ID):
+        for identifier in (HUD_ID, SERVERMOVE_ID, TELEPORT_ID, REPLAY_ID, PATH_ID):
             try:
                 remove_hook(name, Type.POST, identifier)
             except Exception:  # noqa: BLE001, S110 - nothing to do if it was never added
@@ -1137,7 +1481,7 @@ def disable() -> None:
     for name in _Progress.pre_hooks:
         # One list holds both kinds, and removing an identifier that was never added is harmless, so
         # try both rather than tracking which probe claimed which name.
-        for identifier in (FOOTSTEP_ID, NETCODE_ID, TRANSPORT_ID, MOVEFLAG_ID):
+        for identifier in (FOOTSTEP_ID, NETCODE_ID, TRANSPORT_ID, MOVEFLAG_ID, REPLAY_ID):
             try:
                 remove_hook(name, Type.PRE, identifier)
             except Exception:  # noqa: BLE001, S110
@@ -1151,6 +1495,8 @@ def disable() -> None:
     _Progress.pre_hooks.clear()
     _Progress.scanned_functions = False
     _Progress.dumped_animtree = False
+    _Progress.replay_reported = False
+    _Progress.replay_pending = None
 
 
 __all__ = ["disable", "enable", "note", "on_start"]
