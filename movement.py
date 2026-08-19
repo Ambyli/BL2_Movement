@@ -15,7 +15,6 @@ from .config import (
     decay_rate,
     max_duration,
     max_turn_degrees,
-    start_speed,
     steer_rate,
 )
 from .debug import dbg
@@ -110,10 +109,11 @@ def apply_slide_physics(
     The pawn's speed cap is held clear of the forced speed, or the cap clamps the slide back down
     the moment anything lowers GroundSpeed - aiming down sights being the obvious one.
 
-    Acceleration is deliberately left exactly as the engine set it. On the machine that owns the
-    slide that is the player's live input, which is what steering reads below; on the host it is the
-    same vector, unpacked from that player's move. Writing to it would make the two machines'
-    walking physics blend differently and pull their simulations apart.
+    Steering input is read from `slide_data.input_x/y` rather than `pawn.Acceleration`. The driver
+    on the machine that owns the slide samples the pawn's Acceleration into the state each frame,
+    and streams that value to the host so its copy of a remote slide sees the same input. Reading
+    the pawn directly here would let Unreal's Acceleration replication (which lags a move-window
+    and can read zero across it) pull the two simulations apart.
 
     Runs on: BOTH, from the slide driver in `lifecycle`.
     """
@@ -123,11 +123,9 @@ def apply_slide_physics(
     if direction.magnitude == 0:
         return
 
-    # Read the pawn's current input as a candidate steering vector. Zero-magnitude input (no
-    # movement keys held) skips the steering branch entirely and the slide runs in a straight
-    # line at its current heading.
-    accel = Vector(pawn.Acceleration)
-    accel.z = 0
+    # Steering input for this frame. Zero-magnitude input (no movement keys held) skips the steering
+    # branch entirely and the slide runs in a straight line at its current heading.
+    accel = Vector((slide_data.input_x, slide_data.input_y, 0.0))
     if accel.magnitude > 0:
         accel.normalize()
         backwards = accel.dot(direction)
@@ -162,8 +160,10 @@ def apply_slide_physics(
     slide_data.dir_y = direction.y
 
     # Derive absolute speed from the decay curve's speed_pct. SLIDE_SPEED_DEFAULT is where the
-    # curve opens; dividing by it scales the raw tuning to whatever start_speed the user picked.
-    speed = start_speed.value * (slide_data.speed_pct / SLIDE_SPEED_DEFAULT)
+    # curve opens; dividing by it scales the raw tuning to the start_speed captured on the state
+    # when the slide opened, which on the host is the value the client sent rather than the host's
+    # own slider.
+    speed = slide_data.start_speed * (slide_data.speed_pct / SLIDE_SPEED_DEFAULT)
 
     # CrouchedPct is held clear of the actual slide speed so the engine's cap
     # (CrouchedPct * GroundSpeed) can't clamp us; Velocity carries the actual forced motion.

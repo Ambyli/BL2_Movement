@@ -39,6 +39,17 @@ class PlayerSlideState:
     speed_pct: float = SLIDE_SPEED_DEFAULT
     # Seconds this slide has been running, for the hard duration cap.
     elapsed: float = 0.0
+    # Steering input this frame. On the machine that owns the slide the driver samples the pawn's
+    # Acceleration into these; on the host's copy of a remote slide they arrive from the owning
+    # client via `server_slide_input`. Read this rather than pawn.Acceleration in the physics so the
+    # two machines always agree on what the player is pressing, without depending on Unreal's
+    # Acceleration replication being fresh across a movement frame.
+    input_x: float = 0.0
+    input_y: float = 0.0
+    # Absolute speed, in unreal units, that the slide opened at. Captured at slide start rather than
+    # read live from `start_speed.value` in the physics, so the host uses the client's slider value
+    # for the client's slide instead of its own.
+    start_speed: float = 0.0
 
 
 SLIDE_STATES: dict[int, PlayerSlideState] = {}
@@ -115,15 +126,20 @@ def heading_from(pawn: WillowPlayerPawn) -> tuple[float, float]:
     return vel.x, vel.y
 
 
-def begin_slide_state(slide_data: PlayerSlideState, dir_x: float, dir_y: float) -> None:
-    """Open a slide on a known heading, resetting the curve it runs down.
+def begin_slide_state(
+    slide_data: PlayerSlideState,
+    dir_x: float,
+    dir_y: float,
+    start_speed: float,
+) -> None:
+    """Open a slide on a known heading and start speed, resetting the curve it runs down.
 
-    Runs on: BOTH. The machine that owns the slide passes a heading sampled from its own pawn; the
-    host passes the one that arrived with the enter message, so the two agree by construction
-    rather than by each sampling its own copy of the pawn at a different moment.
+    Runs on: BOTH. The machine that owns the slide passes a heading sampled from its own pawn and
+    its own slider value; the host passes what arrived with the enter message, so the two agree by
+    construction rather than by each sampling its own copy of the pawn at a different moment.
 
-    speed_pct and elapsed are reset because this state object outlives any one slide - left alone,
-    the previous slide's spent speed and elapsed time would cut the new one short.
+    speed_pct, elapsed and input are reset because this state object outlives any one slide - left
+    alone, the previous slide's spent speed, elapsed time and last input would carry across.
     """
     slide_data.speed_pct = SLIDE_SPEED_DEFAULT
     slide_data.elapsed = 0.0
@@ -131,3 +147,6 @@ def begin_slide_state(slide_data: PlayerSlideState, dir_x: float, dir_y: float) 
     slide_data.dir_y = dir_y
     slide_data.entry_x = dir_x
     slide_data.entry_y = dir_y
+    slide_data.input_x = 0.0
+    slide_data.input_y = 0.0
+    slide_data.start_speed = start_speed

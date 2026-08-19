@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, cast
 from coroutines import Time, WaitWhile, start_coroutine_tick
 from mods_base import get_pc
 from networking.decorators import host
+from uemath import Vector
 from unrealsdk.unreal import WeakPointer
 
 from . import events
@@ -136,6 +137,20 @@ def _drive_slide(
             _end_slide(pc, pawn, state)
             return
 
+        # Refresh the frame's steering input on the machine that owns this slide - only ever our own
+        # here, since the host's copy of a remote slide has its input written by server_slide_input.
+        # On a client, also forward the sample to the host so its copy reads what we are pressing
+        # instead of Unreal's replicated Acceleration.
+        if state is OWN_SLIDE_STATE:
+            accel = Vector(pawn.Acceleration)
+            state.input_x = accel.x
+            state.input_y = accel.y
+            if is_client():
+                try:
+                    server_slide_input(state.input_x, state.input_y)
+                except Exception as ex:  # noqa: BLE001 - a failed send must never break the driver
+                    dbg(f"INPUT SEND FAILED {type(ex).__name__}: {ex}")
+
         apply_slide_physics(pawn, state, delta_time)
 
 
@@ -143,12 +158,14 @@ def begin_slide(
     pc: WillowPlayerController,
     dir_x: float,
     dir_y: float,
+    speed: float,
     state: PlayerSlideState | None = None,
 ) -> bool:
     """Start driving a slide for this player on this machine. Idempotent.
 
-    Runs on: BOTH - the owning machine calls it from `enter_slide` with its own state object, and
-    the host calls it from the enter message for every other player.
+    Runs on: BOTH - the owning machine calls it from `enter_slide` with its own state object and
+    its own slider value, and the host calls it from the enter message for every other player,
+    passing the heading and start speed that arrived with the message.
 
     Returns True if this call was the one that started it.
     """
@@ -164,7 +181,7 @@ def begin_slide(
     else:
         state.old_z = pawn.Location.Z
         state.is_sliding = True
-    begin_slide_state(state, dir_x, dir_y)
+    begin_slide_state(state, dir_x, dir_y, speed)
     SLIDE_STATES[player] = state
 
     # Boost the replicated crouch multiplier so the speed cap is clear of the forced slide speed
@@ -182,40 +199,63 @@ def enter_slide(pc: WillowPlayerController) -> None:
     if (pawn := cast("WillowPlayerPawn", pc.Pawn)) is None:
         return
     dir_x, dir_y = heading_from(pawn)
+    speed = start_speed.value
     # Register locally before sending, so the slide never depends on the message for anything. On a
     # listen server the message below comes back to us a tick later and has to find this entry
     # already present, or it would start a second driver against the same pawn. And if the send
     # fails, our own slide is already running by then, so the cost is a host that never hears about
     # it rather than a slide that never happens.
-    if not begin_slide(pc, dir_x, dir_y, OWN_SLIDE_STATE):
+    if not begin_slide(pc, dir_x, dir_y, speed, OWN_SLIDE_STATE):
         return
     dbg(
-        f"ENTER client={is_client()} speed={start_speed.value:.0f}"
+        f"ENTER client={is_client()} speed={speed:.0f}"
         f" dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}",
     )
     events.fire(events.slide_started, pc)
     try:
-        server_enter_slide(dir_x, dir_y)
+        server_enter_slide(dir_x, dir_y, speed)
     except Exception as ex:  # noqa: BLE001 - our slide is already running; only the host misses out
         dbg(f"ENTER SEND FAILED {type(ex).__name__}: {ex}")
 
 
 @host.json_message
-def server_enter_slide(dir_x: float, dir_y: float) -> None:
-    """Start the host's copy of a player's slide, on the heading they opened it on.
+def server_enter_slide(dir_x: float, dir_y: float, speed: float) -> None:
+    """Start the host's copy of a player's slide, on the heading and speed they opened it on.
 
     Runs on: HOST only - `host` addresses the message there and nowhere else, so no net-mode guard
     is needed in the body.
 
-    The heading travels with the message rather than being re-sampled here. The host's copy of a
-    remote pawn's velocity is whatever its own simulation last produced, which by the time this
-    arrives is neither the client's heading nor necessarily above the floor `heading_from` needs.
+    Heading and start speed travel with the message rather than being resampled or re-read from the
+    host's own slider here. The host's copy of a remote pawn's velocity is whatever its own
+    simulation last produced (by the time this arrives, neither the client's heading nor
+    necessarily above the floor `heading_from` needs), and the host's slider value is its own -
+    neither is what the client just opened the slide on.
     """
     pc = cast("WillowPlayerController", server_enter_slide.sender.Owner)
     if pc is None:
         return
-    if begin_slide(pc, dir_x, dir_y):
-        dbg(f"SLIDE_ON who={player_id(pc)} dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}")
+    if begin_slide(pc, dir_x, dir_y, speed):
+        dbg(
+            f"SLIDE_ON who={player_id(pc)} speed={speed:.0f}"
+            f" dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}",
+        )
+
+
+@host.json_message
+def server_slide_input(input_x: float, input_y: float) -> None:
+    """Write the sender's live steering input into the host's copy of their slide.
+
+    Runs on: HOST only. Fires once per client-side driver tick during a slide, so the host's copy
+    reads the same steering vector the client's `apply_slide_physics` did on the same frame rather
+    than whatever Unreal's Acceleration replication last produced. No-op if the host has not yet
+    started (or has already ended) its copy of that player's slide - order between this and the
+    enter/exit messages is not something the driver relies on.
+    """
+    pc = cast("WillowPlayerController", server_slide_input.sender.Owner)
+    if pc is None or (state := state_for(pc)) is None:
+        return
+    state.input_x = input_x
+    state.input_y = input_y
 
 
 @host.message
@@ -257,6 +297,7 @@ def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
 network_functions = [
     server_enter_slide,
     server_exit_slide,
+    server_slide_input,
     server_set_slide_jump_velocity,
 ]
 
