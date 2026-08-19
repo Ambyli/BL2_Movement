@@ -60,10 +60,11 @@ class PlayerSlideState:
     # Seconds this slide has been running, for the hard duration cap.
     elapsed: float = 0.0
     # Steering input this frame. On the machine that owns the slide the driver samples the pawn's
-    # Acceleration into these; on the host's copy of a remote slide they arrive from the owning
-    # client via `server_slide_input`. Read this rather than pawn.Acceleration in the physics so the
-    # two machines always agree on what the player is pressing, without depending on Unreal's
-    # Acceleration replication being fresh across a movement frame.
+    # Acceleration into these; on the host's copy of a remote slide the driver pulls the freshest
+    # tagged sample from `sync.host_read`, which also produces the per-frame `steer_catchup_ticks`
+    # value below. Reading this rather than `pawn.Acceleration` in the physics keeps the two
+    # machines agreed on what the player is pressing without depending on Unreal's Acceleration
+    # replication being fresh across a movement frame.
     input_x: float = 0.0
     input_y: float = 0.0
     # Slider-driven physics dials, snapshotted at slide open from the owning machine's
@@ -74,6 +75,15 @@ class PlayerSlideState:
     max_duration: float = 0.0
     steer_rate: float = 0.0
     max_turn_degrees: float = 0.0
+    # Per-slide tick counter incremented on the owning machine each driver tick. Ships with
+    # every `sync.owner_send` so the host can tell how many of its own ticks it is behind on
+    # this sender's input stream, and apply a bounded catch-up when the value changes.
+    driver_tick: int = 0
+    # How many extra ticks worth of steering the physics should fold into this frame's alpha,
+    # written by the driver from `sync.host_read` before `apply_slide_physics` runs and reset to
+    # zero by the physics after consuming it. Only affects the steering step - decay, elapsed
+    # accounting and the turn cone continue to use the real per-frame delta.
+    steer_catchup_ticks: int = 0
 
 
 SLIDE_STATES: dict[int, PlayerSlideState] = {}
@@ -256,6 +266,8 @@ def begin_slide_state(
     slide_data.max_duration = settings.max_duration
     slide_data.steer_rate = settings.steer_rate
     slide_data.max_turn_degrees = settings.max_turn_degrees
+    slide_data.driver_tick = 0
+    slide_data.steer_catchup_ticks = 0
     log.info(
         f"begin_slide_state exit speed_pct={slide_data.speed_pct:.3f}"
         f" entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"

@@ -10,11 +10,11 @@ from __future__ import annotations
 from mods_base import CoopSupport, build_mod
 from networking import add_network_functions
 
-from . import discovery, events, viewmodel
+from . import discovery, events, sync, viewmodel
 from .config import all_options
 from .debug import log
 from .hooks import all_hooks
-from .lifecycle import network_functions
+from .lifecycle import network_functions as lifecycle_network_functions
 
 # Wiring. Presentation subscribes here rather than being called from the slide logic, so movement
 # never needs to know what is watching it. Each future feature (HUD, audio, third-person pose) adds
@@ -49,4 +49,17 @@ mod = build_mod(
     on_disable=_on_disable,
     coop_support=CoopSupport.RequiresAllPlayers,
 )
-add_network_functions(mod, network_functions)
+# Every module that ships its own RPCs contributes to one list here and every entry gets a
+# stable identifier: `<PROTOCOL_PREFIX>:<function qualname>`. Pinned rather than left to the
+# library default of `<module>:<qualname>`, which begins with the mod's directory name - so the
+# same mod unzipped into `sliding` on one machine and `BL2_Movement-main` on another would
+# produce different identifiers, and every message would be discarded on arrival as unknown, in
+# both directions, with nothing but a console warning to show for it. Both players still need
+# matching builds; they no longer need matching folder names.
+PROTOCOL_PREFIX = "sliding"
+
+_all_network_functions = [*lifecycle_network_functions, *sync.network_functions]
+for _func in _all_network_functions:
+    _func.network_identifier = f"{PROTOCOL_PREFIX}:{_func.__wrapped__.__qualname__}"
+
+add_network_functions(mod, _all_network_functions)

@@ -24,7 +24,7 @@ from networking.decorators import host
 from uemath import Vector
 from unrealsdk.unreal import WeakPointer
 
-from . import events
+from . import events, sync
 from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT
 from .debug import every_n, log
 from .movement import apply_slide_physics, can_slide, slide
@@ -109,6 +109,11 @@ def _end_slide(
         pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
         log.info(f"_end_slide reset CrouchedPct={pawn.CrouchedPct:.3f}")
     if state is not OWN_SLIDE_STATE:
+        # Remote slide on the host - drop the per-sender extrapolation cache so the next slide
+        # from this player opens with a clean applied_tick and does not inherit a spurious
+        # "value transitioned" burst from the last slide's residual state.
+        if pc is not None and (player := player_id(pc)) is not None:
+            sync.forget(player)
         log.info("_end_slide exit reason=remote_slide")
         return
 
@@ -153,8 +158,9 @@ def _log_slide_snapshot(
       is looking as they slide.
     - **turn_deg** - unsigned angle from entry heading to current heading; how much the slide has
       already curved (compare against `max_turn_degrees`).
-    - **input** - the raw steering vector driving that turn (sampled locally or arrived via
-      `server_slide_input`).
+    - **input** - the raw steering vector driving that turn. On the owning machine it is the
+      just-sampled `pawn.Acceleration`; on the host's copy of a remote slide it is the freshest
+      known sample from `sync.host_read` (with any catch-up already folded into steering).
     - **speed_forced / speed_actual** - what `apply_slide_physics` just wrote vs. what the engine
       had entering the tick. A persistent gap between them is the signature of something else
       (correction, walking physics, another mod) fighting our writes.
@@ -241,19 +247,30 @@ def _drive_slide(
             log.info("_drive_slide exit reason=slide_ended")
             return
 
-        # Refresh the frame's steering input on the machine that owns this slide - only ever our own
-        # here, since the host's copy of a remote slide has its input written by server_slide_input.
-        # On a client, also forward the sample to the host so its copy reads what we are pressing
-        # instead of Unreal's replicated Acceleration.
+        # Refresh the frame's steering input. Two paths:
+        # - Owning machine (`state is OWN_SLIDE_STATE`): sample the pawn's Acceleration into the
+        #   state, bump the per-slide driver tick, and forward the tagged sample to the host so
+        #   its copy can extrapolate around the input-forwarding lag.
+        # - Host's copy of a remote slide: pull the freshest known input for this player from
+        #   the sync module, along with any catch-up ticks the physics should fold into this
+        #   frame's steering alpha.
         if state is OWN_SLIDE_STATE:
             accel = Vector(pawn.Acceleration)
             state.input_x = accel.x
             state.input_y = accel.y
+            state.driver_tick += 1
             if is_client():
                 try:
-                    server_slide_input(state.input_x, state.input_y)
+                    sync.owner_send(state.input_x, state.input_y, state.driver_tick)
                 except Exception as ex:  # noqa: BLE001 - a failed send must never break the driver
                     log.warning(f"INPUT SEND FAILED {type(ex).__name__}: {ex}")
+        else:
+            # Remote slide on the host. `state_for` is guaranteed non-None by our position in
+            # the driver loop (we would have torn down above otherwise); its PlayerID is the
+            # sync module's key.
+            player = player_id(pc)
+            if player is not None:
+                state.input_x, state.input_y, state.steer_catchup_ticks = sync.host_read(player)
 
         apply_slide_physics(pawn, state, delta_time)
 
@@ -448,32 +465,6 @@ def server_enter_slide(dir_x: float, dir_y: float) -> None:
     log.info(f"server_enter_slide exit started={started}")
 
 
-@host.json_message
-def server_slide_input(input_x: float, input_y: float) -> None:
-    """Write the sender's live steering input into the host's copy of their slide.
-
-    Runs on: HOST only. Fires once per client-side driver tick during a slide, so the host's copy
-    reads the same steering vector the client's `apply_slide_physics` did on the same frame rather
-    than whatever Unreal's Acceleration replication last produced. No-op if the host has not yet
-    started (or has already ended) its copy of that player's slide - order between this and the
-    enter/exit messages is not something the driver relies on.
-    """
-    verbose = every_n("server_slide_input", 30)
-    if verbose:
-        log.debug(f"server_slide_input enter input=({input_x:.2f},{input_y:.2f})")
-    pc = cast("WillowPlayerController", server_slide_input.sender.Owner)
-    if pc is None or (state := state_for(pc)) is None:
-        if verbose:
-            log.debug(
-                f"server_slide_input exit reason=no_state has_pc={pc is not None}",
-            )
-        return
-    state.input_x = input_x
-    state.input_y = input_y
-    if verbose:
-        log.debug(f"server_slide_input exit stored player={player_id(pc)}")
-
-
 @host.message
 def server_exit_slide() -> None:
     """Stop the host's copy of a player's slide. Runs on: HOST only."""
@@ -524,16 +515,7 @@ network_functions = [
     server_announce_settings,
     server_enter_slide,
     server_exit_slide,
-    server_slide_input,
     server_set_slide_jump_velocity,
 ]
-
-# Pinned rather than left to the library default of "<module>:<qualname>", which begins with the
-# mod's *directory name* - so the same mod unzipped into `sliding` on one machine and
-# `BL2_Movement-main` on another produces different identifiers, and every message is discarded on
-# arrival as unknown, in both directions, with nothing but a console warning to show for it. Both
-# players still need matching builds; they no longer need matching folder names.
-PROTOCOL_PREFIX = "sliding"
-
-for _func in network_functions:
-    _func.network_identifier = f"{PROTOCOL_PREFIX}:{_func.__wrapped__.__qualname__}"
+"""Input streaming lives in `sync.py` and exports its own `network_functions`; both lists get
+consolidated in `__init__` and stamped with the shared `PROTOCOL_PREFIX` there."""

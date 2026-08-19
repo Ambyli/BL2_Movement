@@ -182,14 +182,28 @@ def apply_slide_physics(
                 # Steer rate and turn cone come from state (snapshotted at slide open from the
                 # owning player's settings), not live config, so the host steers the client's
                 # slide at the client's rate.
-                alpha = min(slide_data.steer_rate * delta_time * strength, 1.0)
+                #
+                # `steer_catchup_ticks` is the sync module's compensation for input-forwarding
+                # latency on the host's copy of a remote slide: when a fresh input value first
+                # arrives after having been in flight for N host ticks, the host applies N
+                # extra ticks worth of steering this frame to close the direction gap the
+                # client already opened locally. The catch-up folds into the steering alpha
+                # only - decay, elapsed accounting and the turn cone stay on real delta.
+                effective_delta = delta_time * (1 + slide_data.steer_catchup_ticks)
+                alpha = min(slide_data.steer_rate * effective_delta * strength, 1.0)
                 direction = direction.lerp(accel.normalize(), alpha).normalize()
                 if verbose:
                     log.debug(
                         f"apply_slide_physics steer strength={strength:.3f} alpha={alpha:.3f}"
                         f" steer_rate={slide_data.steer_rate:.2f}"
+                        f" catchup={slide_data.steer_catchup_ticks}"
                         f" new_dir=({direction.x:.3f},{direction.y:.3f})",
                     )
+
+    # Consume the catch-up: it applies to a single frame's steering, and leaving it set would
+    # over-rotate the next frame too when the driver was already going to write a fresh value
+    # (zero on steady input, non-zero on the next transition).
+    slide_data.steer_catchup_ticks = 0
 
     # Backstop: never let steering accumulate far enough to reverse the slide, however the input is
     # fed in. Anything past the limit is pinned to the edge of the allowed cone.
