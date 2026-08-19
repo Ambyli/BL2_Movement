@@ -15,6 +15,7 @@ the same slide run down the same curve rather than one of them stepping at packe
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, cast
 
 from coroutines import Time, WaitWhile, start_coroutine_tick
@@ -24,7 +25,7 @@ from uemath import Vector
 from unrealsdk.unreal import WeakPointer
 
 from . import events
-from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT, start_speed
+from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT, max_duration, start_speed
 from .debug import every_n, log
 from .movement import apply_slide_physics, can_slide, slide
 from .state import (
@@ -127,6 +128,74 @@ def _end_slide(
         log.info("_end_slide exit reason=own_slide_torn_down")
 
 
+def _log_slide_snapshot(
+    pc: WillowPlayerController,
+    pawn: WillowPlayerPawn,
+    state: PlayerSlideState,
+    pre_speed: float,
+    delta_time: float,
+) -> None:
+    """Emit one consolidated `SLIDE_TICK` line summarising a slide in progress.
+
+    Called from the driver on the throttled cadence, so a scan of the log reads as one line per
+    slide-frame rather than a stream of individual field dumps. Every field a reader would ask
+    about a slide in progress lives here:
+
+    - **who** - which player, in the Name#Id form the rest of the log uses.
+    - **pos** - absolute location; correlates with position corrections in the netcode log when
+      investigating desync.
+    - **facing_deg** - view yaw in degrees, converted from Unreal's 65536-unit rotation.
+    - **dir** - unit heading the slide is being forced along.
+    - **side_deg** - unsigned angle between facing and slide direction; how sideways the player
+      is looking as they slide.
+    - **turn_deg** - unsigned angle from entry heading to current heading; how much the slide has
+      already curved (compare against `max_turn_degrees`).
+    - **input** - the raw steering vector driving that turn (sampled locally or arrived via
+      `server_slide_input`).
+    - **speed_forced / speed_actual** - what `apply_slide_physics` just wrote vs. what the engine
+      had entering the tick. A persistent gap between them is the signature of something else
+      (correction, walking physics, another mod) fighting our writes.
+    - **pct** - decay curve position, the same value `slide()` logs.
+    - **elapsed / max, progress** - how close to the hard duration cap this slide is.
+    - **ground, crouched_pct** - the two engine flags most likely to end a slide unexpectedly.
+
+    Kept in its own function to keep the driver body focused on the state machine. All the math
+    below only runs when the driver is on a verbose tick, so extracting the call does not shift
+    per-frame cost.
+    """
+    yaw_units = float(pc.Rotation.Yaw)
+    yaw_deg = math.fmod(yaw_units * 360.0 / 65536.0, 360.0)
+    yaw_rad = math.radians(yaw_deg)
+    facing_x = math.cos(yaw_rad)
+    facing_y = math.sin(yaw_rad)
+    slide_dir_mag = math.hypot(state.dir_x, state.dir_y)
+    if slide_dir_mag > 0:
+        side_dot = max(-1.0, min(1.0, (facing_x * state.dir_x + facing_y * state.dir_y) / slide_dir_mag))
+        side_deg = math.degrees(math.acos(side_dot))
+    else:
+        side_deg = 0.0
+    entry_mag = math.hypot(state.entry_x, state.entry_y)
+    if entry_mag > 0 and slide_dir_mag > 0:
+        turn_dot = max(-1.0, min(1.0, (state.entry_x * state.dir_x + state.entry_y * state.dir_y) / (entry_mag * slide_dir_mag)))
+        turn_deg = math.degrees(math.acos(turn_dot))
+    else:
+        turn_deg = 0.0
+    forced_speed = state.start_speed * (state.speed_pct / SLIDE_SPEED_DEFAULT)
+    progress = state.elapsed / max_duration.value if max_duration.value > 0 else 0.0
+    log.debug(
+        f"SLIDE_TICK who={player_id(pc)}"
+        f" pos=({pawn.Location.X:.0f},{pawn.Location.Y:.0f},{pawn.Location.Z:.0f})"
+        f" facing_deg={yaw_deg:.1f} dir=({state.dir_x:.3f},{state.dir_y:.3f})"
+        f" side_deg={side_deg:.1f} turn_deg={turn_deg:.1f}"
+        f" input=({state.input_x:.2f},{state.input_y:.2f})"
+        f" speed_forced={forced_speed:.0f} speed_actual={pre_speed:.0f}"
+        f" pct={state.speed_pct:.3f}"
+        f" elapsed={state.elapsed:.2f}/{max_duration.value:.2f} progress={progress * 100:.0f}%"
+        f" ground={pawn.IsOnGroundOrShortFall()} crouched_pct={pawn.CrouchedPct:.3f}"
+        f" delta={delta_time:.4f}",
+    )
+
+
 def _drive_slide(
     pc_ref: WeakPointer[WillowPlayerController],
     state: PlayerSlideState,
@@ -158,11 +227,9 @@ def _drive_slide(
                 log.debug(f"_drive_slide skip reason=delta<=0 delta={delta_time:.4f}")
             continue
 
-        if verbose:
-            log.debug(
-                f"_drive_slide tick delta={delta_time:.4f}"
-                f" pawn_vel=({pawn.Velocity.X:.0f},{pawn.Velocity.Y:.0f})",
-            )
+        # Read the pawn's velocity BEFORE physics writes to it, so `_log_slide_snapshot` below can
+        # compare what the engine had this frame against what we are about to force onto it.
+        pre_speed = math.hypot(pawn.Velocity.X, pawn.Velocity.Y) if verbose else 0.0
 
         # Physical gate first, then the decay curve. Either ending the slide ends the driver.
         if not can_slide(pc, pawn, state) or slide(pawn, state, delta_time):
@@ -179,11 +246,6 @@ def _drive_slide(
             accel = Vector(pawn.Acceleration)
             state.input_x = accel.x
             state.input_y = accel.y
-            if verbose:
-                log.debug(
-                    f"_drive_slide sampled input=({state.input_x:.2f},{state.input_y:.2f})"
-                    f" is_client={is_client()}",
-                )
             if is_client():
                 try:
                     server_slide_input(state.input_x, state.input_y)
@@ -191,6 +253,9 @@ def _drive_slide(
                     log.warning(f"INPUT SEND FAILED {type(ex).__name__}: {ex}")
 
         apply_slide_physics(pawn, state, delta_time)
+
+        if verbose:
+            _log_slide_snapshot(pc, pawn, state, pre_speed, delta_time)
 
 
 def begin_slide(
