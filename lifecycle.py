@@ -1,286 +1,270 @@
-"""Entering and leaving a slide, and the replication that keeps host and client agreeing.
+"""Entering and leaving a slide, driving it while it runs, and the replication that keeps host and
+client agreeing.
 
-The network messages live here rather than in a module of their own on purpose: `exit_slide` calls
-`server_exit_slide`, and the targeted `client_exit_slide` calls `exit_slide` straight back. They are
-two halves of one protocol, and splitting them would buy a tidier file listing at the cost of a
-genuine import cycle.
+The network messages live here rather than in a module of their own on purpose: ending a slide sends
+`server_exit_slide`, and the arriving `server_enter_slide` calls straight back into `begin_slide`.
+They are two halves of one protocol, and splitting them would buy a tidier file listing at the cost
+of a genuine import cycle.
 
-The server bound messages are `broadcast` rather than `host`, which reads oddly for messages only
-the host acts on. It is deliberate. `host` addresses a message by finding whichever player has
-`bIsPartyLeader` set, re-finds them by player id a frame later when the queue flushes, and silently
-drops the message if either step misses. Logs from a real session showed nine client slides produce
-zero arrivals on the host, while the host's own slides - which never leave the machine - arrived
-every time. `broadcast` does no addressing at all, so none of those steps can fail. The cost is that
-every machine runs these bodies, hence the client guards: this state belongs to the host alone.
+A slide is driven by a coroutine rather than a game hook. The coroutine tick is a plain per-frame
+viewport tick: it does not care whose pawn a slide belongs to, whether that pawn's physics ran this
+frame, or which machine is authoritative over it. One driver therefore serves both our own slide and,
+on the host, every remote one - and it advances at frame cadence on both machines, so two copies of
+the same slide run down the same curve rather than one of them stepping at packet rate.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
+from coroutines import Time, WaitWhile, start_coroutine_tick
 from mods_base import get_pc
-from networking.decorators import broadcast, targeted
-from unrealsdk import unreal
+from networking.decorators import host
+from unrealsdk.unreal import WeakPointer
 
 from . import events
 from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT, start_speed
-from .debug import adopted_stats, dbg, reset_suppressed, suppressed_count
+from .debug import dbg
+from .movement import apply_slide_physics, can_slide, slide
 from .state import (
-    CLIENTS_SLIDE_STATES,
     OWN_SLIDE_STATE,
+    SLIDE_STATES,
     PlayerSlideState,
     begin_slide_state,
+    heading_from,
     is_client,
+    player_id,
+    state_for,
 )
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
+    from coroutines import TickCoroutine
 
 
-@broadcast.json_message
+def _paused() -> bool:
+    """Whether the game is paused.
+
+    A read that fails mid-transition counts as not paused, so the driver falls through to its own
+    teardown check on the next tick rather than stalling forever on a controller that is gone.
+    """
+    try:
+        return bool(get_pc().IsPaused())
+    except Exception:  # noqa: BLE001 - no controller mid-load
+        return False
+
+
+def _forget(state: PlayerSlideState) -> None:
+    """Drop a slide from the live set.
+
+    By identity rather than by key, so this still works when the controller the entry was keyed
+    under has already been destroyed.
+    """
+    state.is_sliding = False
+    for player, other in list(SLIDE_STATES.items()):
+        if other is state:
+            del SLIDE_STATES[player]
+
+
+def _end_slide(
+    pc: WillowPlayerController | None,
+    pawn: WillowPlayerPawn | None,
+    state: PlayerSlideState,
+) -> None:
+    """Stop a slide and hand the pawn back to ordinary crouch physics.
+
+    Idempotent, and it has to be: the driver, the exit message and a jump can all reach this for the
+    same slide within a frame of each other.
+
+    Runs on: BOTH, for whichever slide it is handed.
+    """
+    if not state.is_sliding:
+        return
+    # Clear the flag first and unconditionally. Everything below may fail; this line is what makes
+    # such a failure recoverable, because a slide still flagged on refuses to be re-entered.
+    _forget(state)
+    if pawn is not None:
+        pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
+    if state is not OWN_SLIDE_STATE:
+        return
+
+    # Our own slide, so there is a host to tell and a view model to put back.
+    try:
+        dbg(f"EXIT client={is_client()} elapsed={state.elapsed:.2f}")
+        # Only worth sending while we still have a controller - and isolated, because addressing the
+        # host walks the player list looking for the party leader and raises if it finds nobody.
+        # This runs inside the driver coroutine, where an escaping exception would take the whole
+        # coroutine runner's frame with it rather than just this slide.
+        if pc is not None:
+            server_exit_slide()
+    except Exception as ex:  # noqa: BLE001 - a failed send must never escape the driver
+        dbg(f"EXIT SEND FAILED {type(ex).__name__}: {ex}")
+    finally:
+        # In the `finally` because the view model getting stuck in its slide pose is the single most
+        # visible way this function can fail.
+        if pc is not None:
+            events.fire(events.slide_ended, pc)
+
+
+def _drive_slide(
+    pc_ref: WeakPointer[WillowPlayerController],
+    state: PlayerSlideState,
+) -> TickCoroutine:
+    """Advance one slide, one frame at a time, until it ends.
+
+    Runs on: whichever machine started it - the owning machine for our own slide, the host for every
+    remote one. A weak pointer rather than the controller itself so a player who disconnects or
+    changes level mid-slide takes their driver with them instead of keeping the object alive.
+    """
+    while True:
+        yield WaitWhile(_paused)
+
+        pc = pc_ref()
+        pawn = None if pc is None else cast("WillowPlayerPawn", pc.Pawn)
+        if pc is None or pawn is None:
+            # Death, disconnect or a level change. Nothing left to drive, and nothing to restore
+            # either - the pawn this state described no longer exists.
+            _end_slide(pc, pawn, state)
+            return
+
+        delta_time = Time.delta_time
+        if delta_time <= 0.0:
+            continue
+
+        # Physical gate first, then the decay curve. Either ending the slide ends the driver.
+        if not can_slide(pc, pawn, state) or slide(pawn, state, delta_time):
+            _end_slide(pc, pawn, state)
+            return
+
+        apply_slide_physics(pawn, state, delta_time)
+
+
+def begin_slide(
+    pc: WillowPlayerController,
+    dir_x: float,
+    dir_y: float,
+    state: PlayerSlideState | None = None,
+) -> bool:
+    """Start driving a slide for this player on this machine. Idempotent.
+
+    Runs on: BOTH - the owning machine calls it from `enter_slide` with its own state object, and
+    the host calls it from the enter message for every other player.
+
+    Returns True if this call was the one that started it.
+    """
+    if (player := player_id(pc)) is None or (pawn := cast("WillowPlayerPawn", pc.Pawn)) is None:
+        return False
+    # Membership is liveness - an entry exists only while its slide runs, so finding one means this
+    # is a duplicate and the pawn is already being driven.
+    if player in SLIDE_STATES:
+        return False
+
+    if state is None:
+        state = PlayerSlideState(old_z=pawn.Location.Z, is_sliding=True)
+    else:
+        state.old_z = pawn.Location.Z
+        state.is_sliding = True
+    begin_slide_state(state, dir_x, dir_y)
+    SLIDE_STATES[player] = state
+
+    # Boost the replicated crouch multiplier so the speed cap is clear of the forced slide speed
+    # from the very first frame, before the driver's first tick lands.
+    pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
+    start_coroutine_tick(_drive_slide(WeakPointer(pc), state))
+    return True
+
+
+def enter_slide(pc: WillowPlayerController) -> None:
+    """The local player wants to slide: start driving it here, and tell the host.
+
+    Runs on: whichever machine's local player pressed duck-while-sprinting.
+    """
+    if (pawn := cast("WillowPlayerPawn", pc.Pawn)) is None:
+        return
+    dir_x, dir_y = heading_from(pawn)
+    # Register locally before sending, so the slide never depends on the message for anything. On a
+    # listen server the message below comes back to us a tick later and has to find this entry
+    # already present, or it would start a second driver against the same pawn. And if the send
+    # fails, our own slide is already running by then, so the cost is a host that never hears about
+    # it rather than a slide that never happens.
+    if not begin_slide(pc, dir_x, dir_y, OWN_SLIDE_STATE):
+        return
+    dbg(
+        f"ENTER client={is_client()} speed={start_speed.value:.0f}"
+        f" dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}",
+    )
+    events.fire(events.slide_started, pc)
+    try:
+        server_enter_slide(dir_x, dir_y)
+    except Exception as ex:  # noqa: BLE001 - our slide is already running; only the host misses out
+        dbg(f"ENTER SEND FAILED {type(ex).__name__}: {ex}")
+
+
+@host.json_message
+def server_enter_slide(dir_x: float, dir_y: float) -> None:
+    """Start the host's copy of a player's slide, on the heading they opened it on.
+
+    Runs on: HOST only - `host` addresses the message there and nowhere else, so no net-mode guard
+    is needed in the body.
+
+    The heading travels with the message rather than being re-sampled here. The host's copy of a
+    remote pawn's velocity is whatever its own simulation last produced, which by the time this
+    arrives is neither the client's heading nor necessarily above the floor `heading_from` needs.
+    """
+    pc = cast("WillowPlayerController", server_enter_slide.sender.Owner)
+    if pc is None:
+        return
+    if begin_slide(pc, dir_x, dir_y):
+        dbg(f"SLIDE_ON who={player_id(pc)} dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}")
+
+
+@host.message
+def server_exit_slide() -> None:
+    """Stop the host's copy of a player's slide. Runs on: HOST only."""
+    pc = cast("WillowPlayerController", server_exit_slide.sender.Owner)
+    if pc is None or (state := state_for(pc)) is None:
+        return
+    _end_slide(pc, cast("WillowPlayerPawn", pc.Pawn), state)
+    dbg(f"SLIDE_OFF who={player_id(pc)}")
+
+
+@host.json_message
 def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
     """Carry a slide's momentum into the jump that ended it, on the machine that owns movement.
 
     The client force-calls `DoJump` on its own pawn, because crouching swallows the ordinary jump
     input and a slide holds crouch throughout. That call is purely local - it sets no replicated
-    flag - so without this the server never learns the player left the ground, keeps simulating them
-    walking, and corrects the jump away as fast as it is predicted. Hence the `DoJump` here too:
-    the server has to make the same move, not merely be told the resulting velocity.
+    flag - so without this the host never learns the player left the ground, keeps simulating them
+    walking, and corrects the jump away as fast as it is predicted. Hence the `DoJump` here too: the
+    host has to make the same move, not merely be told the resulting velocity.
 
-    Runs on: HOST only. `broadcast` fires on every machine; the client guard turns it into a no-op
-    everywhere except the host.
+    Runs on: HOST only.
     """
-    # Only the host owns the authoritative pawn state; every other machine ignores this body.
-    if is_client():
-        return
-    # Identify which player sent the RPC via the decorator-injected `sender.Owner`.
     pc = cast("WillowPlayerController", server_set_slide_jump_velocity.sender.Owner)
-    # Bail if that player has no pawn (mid-transition, respawn window, etc.).
-    if (pawn := pc.Pawn) is None:
+    if pc is None or (pawn := pc.Pawn) is None:
         return
-    # If the RPC arrived on the same frame the client's DoJump ran, the server's copy of the pawn
-    # is still grounded. Kick it into the falling state so the velocity write below survives
-    # walking-physics clamps on the next tick.
+    # If this arrived on the same frame the client's DoJump ran, the host's copy of the pawn is
+    # still grounded. Kick it into the falling state so the velocity write survives walking physics.
     if pawn.IsOnGroundOrShortFall():
         pawn.DoJump(True)
-    # Adopt the client's stashed horizontal velocity so the server integrates the same arc the
-    # client is already predicting. This is what stops the server from correcting the jump away.
     pawn.Velocity.X = vel_x
     pawn.Velocity.Y = vel_y
-    dbg(f"SERVER_JUMP from={pc.PlayerReplicationInfo.PlayerName} vel=({vel_x:.0f},{vel_y:.0f})")
-
-
-def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
-    """Start, or restart, the host's copy of a player's slide. Idempotent.
-
-    Kept split from the network message, and kept idempotent, though only one route reaches it now.
-    A second route used to: a spare bit claimed in the move stream's CompressedFlags, which arrived
-    a frame or two sooner. It was removed because setting that bit dragged a sliding client toward
-    world origin with their own heading ignored - the bit was only ever *observed unused*, which
-    says BL2 never sets it and nothing at all about whether the server reads it. Bisecting the mod
-    switch by switch is what pinned it there. Do not reclaim a flag bit on that evidence again.
-
-    Runs on: HOST only. Sole caller is the broadcast RPC body.
-
-    Returns True if this call was the one that started it.
-    """
-    # Defensive: refuse on client machines, and skip if the pawn has vanished.
-    if is_client() or (pawn := pc.Pawn) is None:
-        return False
-
-    # Look for an existing state for this PC, sweeping dead weak-refs as we go.
-    for player in CLIENTS_SLIDE_STATES.copy():
-        if (_pc := player()) is None:
-            # Weak pointer resolved to nothing - the controller was GC'd. Drop the entry.
-            CLIENTS_SLIDE_STATES.pop(player)
-        elif _pc == pc:
-            data = CLIENTS_SLIDE_STATES[player]
-            # Live entry, already sliding -> this is a duplicate from the other route. No-op.
-            if data.is_sliding:
-                return False
-            # Live entry, not currently sliding -> reactivate in place.
-            data.is_sliding = True
-            data.old_z = pawn.Location.Z
-            begin_slide_state(cast("WillowPlayerPawn", pawn), data)
-            break
-    else:
-        # No entry at all - first slide from this player this session. Allocate, initialize, store.
-        data = PlayerSlideState(old_z=pawn.Location.Z, is_sliding=True)
-        begin_slide_state(cast("WillowPlayerPawn", pawn), data)
-        CLIENTS_SLIDE_STATES[unreal.WeakPointer(pc)] = data
-
-    # Boost the replicated crouch multiplier so any observer sees slide-scale speed until the
-    # PhysWalking hook takes over integration on this pawn's next frame.
-    pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
-    loc = pawn.Location
-    dbg(
-        f"SLIDE_ON via={source} who={pc.PlayerReplicationInfo.PlayerName}"
-        f" n={len(CLIENTS_SLIDE_STATES)} at=({loc.X:.0f},{loc.Y:.0f})",
-    )
-    # True: this call was the winner. False was returned above for a duplicate from the other route.
-    return True
-
-
-def end_server_slide(pc: WillowPlayerController, source: str) -> bool:
-    """Stop the host's copy of a player's slide. Idempotent, for the same reason.
-
-    Runs on: HOST only. Same sole caller as begin_server_slide: the broadcast RPC body.
-    """
-    # Bail on clients.
-    if is_client():
-        return False
-    # Restore the pawn's normal crouch multiplier so walking physics goes back to real crouch speed
-    # on the host and on remote observers via replication.
-    if (pawn := pc.Pawn) is not None:
-        pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-
-    # Walk the dict, flip every matching sliding entry to not-sliding. `stopped` records whether we
-    # actually changed anything - False here means the slide was already off (duplicate call from
-    # the other route).
-    stopped = False
-    for player in CLIENTS_SLIDE_STATES.copy():
-        if (_pc := player()) is None:
-            CLIENTS_SLIDE_STATES.pop(player)
-        elif _pc == pc and CLIENTS_SLIDE_STATES[player].is_sliding:
-            CLIENTS_SLIDE_STATES[player].is_sliding = False
-            stopped = True
-    if stopped:
-        # Only log on the winning end call, not on duplicates.
-        dbg(f"SLIDE_OFF via={source} who={pc.PlayerReplicationInfo.PlayerName}")
-    # True: this call ended a live slide. False: it was already ended (or nothing to end).
-    return stopped
-
-
-@broadcast.message
-def server_exit_slide() -> None:
-    # Runs on: HOST only. Broadcast body; every other machine no-ops via the client guard.
-    if is_client():
-        return
-    # Delegate to the shared end path, tagged so debug can distinguish RPC-driven ends from
-    # move-flag-driven ends. If the move-flag route already ended this slide, end_server_slide
-    # detects it via `stopped` and quietly returns False.
-    end_server_slide(cast("WillowPlayerController", server_exit_slide.sender.Owner), "message")
-
-
-@broadcast.message
-def server_enter_slide() -> None:
-    # Runs on: HOST only. Same shape as server_exit_slide - broadcast + client guard.
-    if is_client():
-        return
-    # Delegate to the shared start path, tagged "message". A duplicate call (move-flag route got
-    # there first) is detected inside begin_server_slide and returns False.
-    begin_server_slide(cast("WillowPlayerController", server_enter_slide.sender.Owner), "message")
-
-
-def enter_slide(pc: WillowPlayerController) -> None:
-    """The client wants to slide; tells the host, but starts its own presentation immediately.
-
-    Runs on: whichever machine's local player pressed duck-while-sprinting. Called from the
-    `DuckPressed` hook in hooks.py. On a listen-server host, that's the host machine; on a client,
-    that's the client machine. Both paths land here identically.
-    """
-    # Already sliding? Refuse - re-entering would re-lock the heading and reset decay.
-    if OWN_SLIDE_STATE.is_sliding:
-        return
-    # Fire the broadcast RPC so every machine sees the start. On the host it populates the slide
-    # dict; on other clients the body no-ops via the is_client guard. This runs BEFORE the local
-    # prediction below so, in the common case, the host learns about our slide by the time our own
-    # first-frame ServerMove arrives with the slide bit set.
-    server_enter_slide()
-    # Reset per-slide diagnostic counters (suppressed corrections, adopted moves, worst gap) so the
-    # exit log describes just this slide.
-    reset_suppressed()
-    # Local prediction: mark ourselves as sliding, stamp starting Z for slope calc, initialize the
-    # state dataclass (which locks entry heading from the pawn's current velocity), and boost
-    # CrouchedPct so the very next frame walks at slide speed until the POST hook takes over the
-    # velocity write.
-    OWN_SLIDE_STATE.is_sliding = True
-    OWN_SLIDE_STATE.old_z = pc.Pawn.Location.Z
-    begin_slide_state(cast("WillowPlayerPawn", pc.Pawn), OWN_SLIDE_STATE)
-    pc.Pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
-    dbg(
-        f"ENTER_OWN client={is_client()} speed={start_speed.value:.0f} "
-        f"dir=({OWN_SLIDE_STATE.dir_x:.2f},{OWN_SLIDE_STATE.dir_y:.2f}) "
-        f"clients={len(CLIENTS_SLIDE_STATES)}",
-    )
-    # Notify subscribers - viewmodel dips the weapon, future audio/HUD hooks would fire here.
-    events.fire(events.slide_started, pc)
-
-
-def exit_slide(pc: WillowPlayerController) -> None:
-    """End the local player's slide on whichever machine owns it.
-
-    Runs on: same machine that called enter_slide (client or host, symmetric with the entry path).
-    Reachable from three places: the PlayerMove exit checks in hooks.handle_move, the local
-    speed/duration floor in movement.slide via client_exit_slide, and the client_exit_slide
-    targeted RPC below when the host tells this client to stop.
-    """
-    # Not sliding? No-op. Idempotency matters: PlayerMove and client_exit_slide can fire on the
-    # same frame.
-    if not OWN_SLIDE_STATE.is_sliding:
-        return
-    # Clear the local flag first and unconditionally. Everything below is allowed to fail; this
-    # line is what makes the failure recoverable, because a slide that is still flagged on refuses
-    # re-entry in enter_slide and leaves the player stuck in a slide they cannot restart.
-    OWN_SLIDE_STATE.is_sliding = False
-
-    # The rest is wrapped so a raise can never skip the event fire in the `finally`. A None pawn
-    # here is routine - respawn and level transitions both reach this path - and letting that
-    # AttributeError escape would strand the weapon in its slide pose for the rest of the session,
-    # since nothing else ever calls the view model back.
-    try:
-        # Restore the normal crouch multiplier so residual motion decays with ordinary
-        # walking/crouching physics.
-        if (pawn := pc.Pawn) is not None:
-            pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-        # Read final diagnostics for this slide - how many corrections the host suppressed on our
-        # behalf, how many positions the host adopted, and the worst gap ever seen between our
-        # claim and the server sim. All from the accumulators in debug.py.
-        adopted, worst = adopted_stats()
-        dbg(
-            f"EXIT client={is_client()} suppressed={suppressed_count()}"
-            f" adopted={adopted} worst_gap={worst:.0f}",
-        )
-        # Tell the host to stop tracking us. Once the host runs end_server_slide, the correction
-        # suppression hook stops blocking and any real disagreement can flow through as a normal
-        # ClientAdjustPosition. The move-flag route will independently reach the same conclusion on
-        # the next move that lacks the slide bit.
-        server_exit_slide()
-    finally:
-        # Notify subscribers - viewmodel returns weapon to resting pose. In the `finally` because
-        # the view model getting stuck on is the single most visible way this function can fail.
-        events.fire(events.slide_ended, pc)
-
-
-@targeted.message
-def client_exit_slide() -> None:
-    # Runs on: ONE specific client - the one the host addressed. `targeted.message` fires only on
-    # the target machine, unlike `broadcast` which fires everywhere.
-    # The host called this because its own slide simulation decided we should be done (speed
-    # dropped below floor, duration cap hit, host-side end conditions). The host has already
-    # dropped us from CLIENTS_SLIDE_STATES; this call syncs our local state to match.
-    exit_slide(cast("WillowPlayerController", get_pc()))
+    dbg(f"SERVER_JUMP who={player_id(pc)} vel=({vel_x:.0f},{vel_y:.0f})")
 
 
 # Passed explicitly to add_network_functions: it only scans the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
 network_functions = [
-    server_set_slide_jump_velocity,
-    server_exit_slide,
     server_enter_slide,
-    client_exit_slide,
+    server_exit_slide,
+    server_set_slide_jump_velocity,
 ]
 
-# --- wire identifiers ------------------------------------------------------------------------------
-# Pinned, rather than left to the library default of "<module>:<qualname>". That default begins with
-# the mod's *directory name*, so the same mod unzipped into `sliding` on one machine and
+# Pinned rather than left to the library default of "<module>:<qualname>", which begins with the
+# mod's *directory name* - so the same mod unzipped into `sliding` on one machine and
 # `BL2_Movement-main` on another produces different identifiers, and every message is discarded on
-# arrival as unknown - in both directions, with nothing but a console warning to show for it. That is
-# not hypothetical; it is what two session logs showed after the rest of the transport was proven
-# working. A GitHub zip extracts as `<repo>-main`, so the mismatch recurs on every fresh download.
-#
-# Pinning the prefix makes the protocol depend on the mod, not on where somebody happened to put it.
-# Both players still need matching builds, but they no longer need matching folder names.
+# arrival as unknown, in both directions, with nothing but a console warning to show for it. Both
+# players still need matching builds; they no longer need matching folder names.
 PROTOCOL_PREFIX = "sliding"
 
 for _func in network_functions:

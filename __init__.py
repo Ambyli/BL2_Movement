@@ -7,16 +7,12 @@ reverse. See the individual modules; this one only assembles them.
 
 from __future__ import annotations
 
-from mods_base import build_mod
+from mods_base import CoopSupport, build_mod
 from networking import add_network_functions
 
 from . import discovery, events, viewmodel
 from .config import all_options
-from .hooks import (
-    all_hooks,
-    disable_phys_sliding,
-    enable_phys_sliding,
-)
+from .hooks import all_hooks
 from .lifecycle import network_functions
 
 # Wiring. Presentation subscribes here rather than being called from the slide logic, so movement
@@ -25,20 +21,18 @@ from .lifecycle import network_functions
 events.slide_started.append(viewmodel.on_start)
 events.slide_ended.append(viewmodel.on_end)
 
-# Temporary, removed with the rest of the diagnostics in the cleanup phase. It rides the same event
-# rather than hooking anything of its own, which is the point of the event list.
+# Diagnostics ride the same event rather than hooking anything of their own, which is the point of
+# the event list.
 events.slide_started.append(discovery.on_start)
 events.slide_ended.append(discovery.on_end)
 
 
 def _on_enable() -> None:
-    enable_phys_sliding()
     discovery.enable()
 
 
 def _on_disable() -> None:
     discovery.disable()
-    disable_phys_sliding()
 
 
 # Both of these only scan the calling module's scope, so the lists have to be handed over
@@ -48,5 +42,6 @@ mod = build_mod(
     options=all_options,
     on_enable=_on_enable,
     on_disable=_on_disable,
+    coop_support=CoopSupport.RequiresAllPlayers,
 )
 add_network_functions(mod, network_functions)

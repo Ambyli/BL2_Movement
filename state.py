@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, ClassVar, cast
 from mods_base import ENGINE
 from uemath import Vector
 from unrealsdk import find_enum
-from unrealsdk.unreal import WeakPointer
 
 from .config import SLIDE_SPEED_DEFAULT
 
@@ -42,8 +41,24 @@ class PlayerSlideState:
     elapsed: float = 0.0
 
 
-CLIENTS_SLIDE_STATES: dict[WeakPointer[WillowPlayerController], PlayerSlideState] = {}
+SLIDE_STATES: dict[int, PlayerSlideState] = {}
+"""Every slide running on this machine, keyed by PlayerID.
+
+Keyed by id rather than by a controller reference because a level change replaces every controller
+object while the id survives. Membership is liveness: an entry exists only while its slide runs.
+
+On a client this only ever holds our own slide - remote pawns are simulated proxies whose position
+arrives through BL2's normal replication, so there is nothing for us to drive. On the host it holds
+every sliding player, our own included.
+"""
+
 OWN_SLIDE_STATE: PlayerSlideState = PlayerSlideState(old_z=0, is_sliding=False)
+"""The local player's slide, registered into SLIDE_STATES under our own id while it runs.
+
+One stable object for the life of the session rather than a fresh one per slide: `begin_slide_state`
+resets every field in place, and object identity is how the driver tells our own slide from a
+remote one without a second lookup.
+"""
 
 e_net_mode: WorldInfo.ENetMode = cast("WorldInfo.ENetMode", find_enum("ENetMode"))
 
@@ -51,53 +66,68 @@ e_net_mode: WorldInfo.ENetMode = cast("WorldInfo.ENetMode", find_enum("ENetMode"
 def is_client() -> bool:
     """Whether this Python interpreter is running on a network client vs. the host.
 
-    Runs on: BOTH. Every host-guarded function in the mod calls this to bail early on clients.
     NM_Client means "we are a client connected to a remote host"; NM_Standalone / NM_ListenServer
-    both return False here, so single-player and listen-server-host both take the host branches.
+    both return False here, so single-player and listen-server-host both count as the host.
     """
     return cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().NetMode == e_net_mode.NM_Client
 
 
 def world_time() -> float:
-    """Current world time in seconds. Used to tell frames apart when deduplicating tick sources.
+    """Current world time in seconds.
 
-    Runs on: BOTH. Every machine has its own world time; comparisons only make sense against
-    values captured earlier on the same machine.
+    Every machine has its own; comparisons only mean anything against values captured earlier on
+    the same machine.
     """
     return float(cast("WillowGameEngine", ENGINE).GetCurrentWorldInfo().TimeSeconds)
 
 
-def begin_slide_state(pawn: WillowPlayerPawn, slide_data: PlayerSlideState) -> None:
-    """Lock in the heading a slide was entered at.
+def player_id(pc: WillowPlayerController) -> int | None:
+    """This controller's stable network id, or None if it has no replication info.
 
-    Runs on: BOTH. Called from `lifecycle.enter_slide` for the local slide and from
-    `lifecycle.begin_server_slide` for the host's copy of every remote slide - so this function
-    executes on every machine that needs to remember where a slide started.
+    `getattr` rather than attribute access because callers hand this whatever controller they have,
+    including AI ones that carry no PlayerReplicationInfo at all.
     """
-    # Reset the two curve state values. If this call is reactivating an existing entry (see
-    # begin_server_slide), the previous slide's spent speed_pct and elapsed would otherwise leak
-    # into the new one and either cut it short or run it past duration.
-    slide_data.speed_pct = SLIDE_SPEED_DEFAULT
-    slide_data.elapsed = 0.0
+    if (pri := getattr(pc, "PlayerReplicationInfo", None)) is None:
+        return None
+    return int(pri.PlayerID)
 
-    # Read the pawn's current horizontal velocity - that's the direction we lock the slide to.
-    # Z is dropped: slopes affect decay but never rotate the heading.
+
+def state_for(pc: WillowPlayerController) -> PlayerSlideState | None:
+    """The live slide governing this controller, or None if it is not sliding."""
+    if (player := player_id(pc)) is None:
+        return None
+    state = SLIDE_STATES.get(player)
+    return state if state is not None and state.is_sliding else None
+
+
+def heading_from(pawn: WillowPlayerPawn) -> tuple[float, float]:
+    """The unit heading to lock a slide to, read off the pawn's current horizontal velocity.
+
+    Z is dropped: slopes affect decay but never rotate the heading. Returns (0, 0) when the pawn was
+    effectively stationary - opened from a jump landing, say - which leaves the slide with no
+    heading to force and makes `apply_slide_physics` a no-op until one arrives.
+    """
     vel = Vector(pawn.Velocity)
     vel.z = 0
-    # Sub-1 uu/s means the player was effectively stationary when they opened the slide (opened
-    # from a jump landing, for instance). No heading to lock; apply_slide_physics's magnitude
-    # check will make the whole physics write a no-op until entry_x/y are populated another way.
     if vel.magnitude < 1.0:
-        slide_data.dir_x = 0.0
-        slide_data.dir_y = 0.0
-        slide_data.entry_x = 0.0
-        slide_data.entry_y = 0.0
-        return
-    # Normalise once, and store the unit vector as both the current heading (dir_x/y) and the
-    # locked entry heading (entry_x/y). The turn-cone clamp in apply_slide_physics measures
-    # against entry_x/y for the life of the slide.
+        return 0.0, 0.0
     vel.normalize()
-    slide_data.dir_x = vel.x
-    slide_data.dir_y = vel.y
-    slide_data.entry_x = vel.x
-    slide_data.entry_y = vel.y
+    return vel.x, vel.y
+
+
+def begin_slide_state(slide_data: PlayerSlideState, dir_x: float, dir_y: float) -> None:
+    """Open a slide on a known heading, resetting the curve it runs down.
+
+    Runs on: BOTH. The machine that owns the slide passes a heading sampled from its own pawn; the
+    host passes the one that arrived with the enter message, so the two agree by construction
+    rather than by each sampling its own copy of the pawn at a different moment.
+
+    speed_pct and elapsed are reset because this state object outlives any one slide - left alone,
+    the previous slide's spent speed and elapsed time would cut the new one short.
+    """
+    slide_data.speed_pct = SLIDE_SPEED_DEFAULT
+    slide_data.elapsed = 0.0
+    slide_data.dir_x = dir_x
+    slide_data.dir_y = dir_y
+    slide_data.entry_x = dir_x
+    slide_data.entry_y = dir_y

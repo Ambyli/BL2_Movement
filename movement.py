@@ -19,14 +19,14 @@ from .config import (
     steer_rate,
 )
 from .debug import dbg
-from .state import OWN_SLIDE_STATE, PlayerSlideState, is_client
+from .state import PlayerSlideState
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
 
 
 POST_LOG_EVERY: int = 30
-"""One line per this many forced frames. See the note in `apply_slide_physics`."""
+"""One line per this many forced frames, so a slide costs a handful of lines rather than hundreds."""
 
 
 class _PostLog:
@@ -34,54 +34,53 @@ class _PostLog:
 
 
 def _who(pawn: WillowPlayerPawn) -> str:
-    """Name the pawn a forced frame belongs to.
+    """Name the pawn a forced frame belongs to, as `Name#PlayerID`.
 
-    `apply_slide_physics` drives both our own slide and every remote one, so an untagged line cannot
-    be attributed - two players' decay curves interleave and read as one curve jumping backwards.
+    The host drives every player's slide through here, so an untagged line cannot be attributed and
+    two decay curves interleave into one that appears to jump backwards. The id is on the end
+    because display names are not unique - two machines signed in to the same account report the
+    same name, which is exactly the session this most needs to be readable in.
     """
     try:
-        return str(pawn.Controller.PlayerReplicationInfo.PlayerName)
+        pri = pawn.Controller.PlayerReplicationInfo
+        return f"{pri.PlayerName}#{pri.PlayerID}"
     except Exception:  # noqa: BLE001 - a label is not worth raising over
         return "?"
 
 
-def can_slide(pc: WillowPlayerController, pawn: WillowPlayerPawn) -> bool:
-    """Whether the local player's slide should still be running this frame.
+def can_slide(
+    pc: WillowPlayerController,
+    pawn: WillowPlayerPawn,
+    slide_data: PlayerSlideState,
+) -> bool:
+    """Whether this slide should still be running.
 
-    Runs on: whichever machine owns the slide (client or host). Read from handle_move as the
-    per-frame exit gate. Note that it checks OWN_SLIDE_STATE, not the shared dict - this only
-    speaks about the local player, never remote ones.
+    Runs on: BOTH, against whichever player's state it is handed - our own on the machine that owns
+    it, and every sliding player on the host. `bDuck` reaches the host for a remote player through
+    the move stream's compressed flags, so the same gate reads true on both machines.
     """
-    return (
-        OWN_SLIDE_STATE.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
-    )
+    return slide_data.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
 
 
 def slide(
-    pc: WillowPlayerController,
+    pawn: WillowPlayerPawn,
     slide_data: PlayerSlideState,
     delta_time: float,
 ) -> bool:
     """Advance the decay curve and report whether the slide is spent. Called every frame.
 
     Owns nothing else: heading and velocity are applied in `apply_slide_physics`, and ending the
-    slide is the caller's job. Returning the verdict rather than acting on it is what lets the two
-    callers end a slide the way that suits them - `handle_move` calls `exit_slide` directly for the
-    local player, while `_phys_sliding` sends the targeted RPC for a remote one. Dispatching from
-    in here meant the local player's own exit took a queued network round-trip to itself, one
-    message per player tick, to say something it already knew.
+    slide is the caller's job.
 
-    Runs on: BOTH. Called from `hooks.handle_move` (PRE PlayerMove) for the local slide, and from
-    `hooks._phys_sliding` for whichever pawn that hook is running against.
+    Runs on: BOTH, from the slide driver in `lifecycle`.
 
     Returns True when the slide is spent and the caller should end it.
     """
     # Height difference against last frame, in unreal units.
-    z_diff: float = pc.Pawn.Location.Z - slide_data.old_z
+    z_diff: float = pawn.Location.Z - slide_data.old_z
 
-    # Time decay applies on every frame. Upstream skipped it entirely whenever the frame was
-    # downhill, so even the gentlest grade left a slide running indefinitely; now a slope only
-    # offsets the decay, and has to be genuinely steep to offset it fully.
+    # Time decay applies on every frame; a slope only offsets it, and has to be genuinely steep to
+    # offset it fully.
     speed = slide_data.speed_pct - delta_time * decay_rate.value
     if z_diff < 0:
         speed -= z_diff * 0.0005  # downhill, wins some speed back
@@ -91,14 +90,13 @@ def slide(
     # A slope may sustain a slide, but never push it past the speed it opened at.
     speed = min(speed, SLIDE_SPEED_DEFAULT)
 
-    # Persist the frame's result back into the state dataclass. `old_z` becomes the next frame's
-    # baseline for the slope calc, `speed_pct` feeds into apply_slide_physics's speed derivation,
-    # and `elapsed` is checked against the hard duration cap below.
-    slide_data.old_z = pc.Pawn.Location.Z
+    # Persist the frame's result. `old_z` is the next frame's slope baseline, `speed_pct` feeds
+    # apply_slide_physics, and `elapsed` is checked against the hard duration cap below.
+    slide_data.old_z = pawn.Location.Z
     slide_data.speed_pct = speed
     slide_data.elapsed += delta_time
 
-    # Exit verdict: either the decay bled below the walking-crouch floor, or the duration cap hit.
+    # Exit verdict: the decay bled below the walking-crouch floor, or the duration cap hit.
     return speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= max_duration.value
 
 
@@ -107,20 +105,20 @@ def apply_slide_physics(
     slide_data: PlayerSlideState,
     delta_time: float,
 ) -> None:
-    """Force the slide's heading and speed onto the pawn, after the engine has had its say.
+    """Force the slide's heading and speed onto the pawn.
 
-    PlayerMove recomputes velocity from input every frame, so anything written before it runs is
-    thrown away - this must be called from a post hook to be the value the walking physics actually
-    integrates. The pawn's speed cap is held clear of the forced speed, or the cap clamps the slide
-    back down the moment anything lowers GroundSpeed (aiming down sights being the obvious one).
-    Acceleration is zeroed only where we are the authority; see the note at that line.
+    The pawn's speed cap is held clear of the forced speed, or the cap clamps the slide back down
+    the moment anything lowers GroundSpeed - aiming down sights being the obvious one.
 
-    Runs on: BOTH. Called from `enforce_slide` (POST PlayerMove) on the machine that owns the
-    local slide, and from `_drive_remote_slide` (POST MoveAutonomous) on the host for every
-    remote slide. Both are POST hooks by design - see the docstring on either caller.
+    Acceleration is deliberately left exactly as the engine set it. On the machine that owns the
+    slide that is the player's live input, which is what steering reads below; on the host it is the
+    same vector, unpacked from that player's move. Writing to it would make the two machines'
+    walking physics blend differently and pull their simulations apart.
+
+    Runs on: BOTH, from the slide driver in `lifecycle`.
     """
-    # Current slide heading, projected to the ground plane. If it's zero the entry heading was
-    # never locked (opened from a standstill) and there is nothing to force onto the pawn.
+    # Current slide heading, projected to the ground plane. Zero means the entry heading was never
+    # locked (opened from a standstill) and there is nothing to force onto the pawn.
     direction = Vector((slide_data.dir_x, slide_data.dir_y, 0.0))
     if direction.magnitude == 0:
         return
@@ -137,7 +135,7 @@ def apply_slide_physics(
             # Drop the part of the input running back down the slide, then steer on whatever
             # sideways component survives - weighted by how sideways it actually is. Normalising it
             # unweighted turns a hair of residue from a near-backwards input into a full strength
-            # turn, which is precisely how holding back used to spin the slide right around.
+            # turn, which is how holding back spins a slide right around.
             if backwards < 0:
                 accel = accel - direction * backwards
             strength = accel.magnitude
@@ -167,17 +165,12 @@ def apply_slide_physics(
     # curve opens; dividing by it scales the raw tuning to whatever start_speed the user picked.
     speed = start_speed.value * (slide_data.speed_pct / SLIDE_SPEED_DEFAULT)
 
-    # Forcing the pawn state. CrouchedPct is held clear of the actual slide speed so the engine's
-    # cap (CrouchedPct * GroundSpeed) can't clamp us; Velocity carries the actual forced motion.
-    pawn.CrouchedPct = max(
-        SLIDE_SPEED_DEFAULT, (speed / max(pawn.GroundSpeed, 1.0)) * 2.0
-    )
+    # CrouchedPct is held clear of the actual slide speed so the engine's cap
+    # (CrouchedPct * GroundSpeed) can't clamp us; Velocity carries the actual forced motion.
+    pawn.CrouchedPct = max(SLIDE_SPEED_DEFAULT, (speed / max(pawn.GroundSpeed, 1.0)) * 2.0)
     pawn.Velocity.X = direction.x * speed
     pawn.Velocity.Y = direction.y * speed
 
-    # Throttled deliberately. Logging this every frame burned 391 of the debug log's 400 lines on
-    # two slides and silently dropped the whole of the next session - the rare lines are the ones
-    # worth having, and per-frame detail crowds them out.
     _PostLog.frames += 1
     if _PostLog.frames % POST_LOG_EVERY == 0:
         dbg(f"POST {_who(pawn)} pct={slide_data.speed_pct:.2f} set={speed:.0f}")

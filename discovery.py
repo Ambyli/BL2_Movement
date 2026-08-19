@@ -1,6 +1,6 @@
 """Phase 2 discovery: answers, in one game session, every runtime question the rest of the mod needs.
 
-Deleted alongside `debug.py` in the cleanup phase. Nothing imports this except `__init__`.
+Nothing imports this except `__init__`; it hooks nothing the mod relies on.
 
 Each in-game round trip costs a full quit, relaunch and save reload, which has been by far the
 slowest part of building this mod. So rather than one restart per unknown, this gathers all four at
@@ -160,14 +160,13 @@ NETCODE_ID = "SlidingDiscoveryNetcode"
 
 # The replay probe. When the server corrects a client, UE3 does not merely snap it - PlayerTick sees
 # bUpdatePosition and calls ClientUpdatePosition, which re-runs every unacknowledged SavedMove
-# through MoveAutonomous. That path never goes through PlayerWalking.PlayerMove, which is where
-# `hooks.enforce_slide` lives, so the replayed frames would be re-simulated as ordinary crouch
-# walking with the locked slide heading discarded. This brackets the call and measures exactly that:
-# whether `_Phys.applied` advances across it, and what the pawn's heading looks like on either side.
+# through MoveAutonomous. The slide driver is a coroutine on the viewport tick, so it does not run
+# inside that replay at all: the replayed frames are re-simulated as ordinary crouch walking with
+# the locked heading discarded. This brackets the call and measures how far that pulls the pawn off
+# its slide - whether the forced-frame count advances across it, and the heading on either side.
 #
-# ClientUpdatePosition is script in stock UE3, but so was PhysWalking by that reasoning and it has
-# never once dispatched - so the name is verified by the function scan rather than assumed, and the
-# probe logs a one-shot line the moment it actually fires. No line means it never ran.
+# The function name is taken from the function scan rather than assumed, and the probe logs a
+# one-shot line the moment it actually fires. No line means it never ran.
 REPLAY_ID = "SlidingDiscoveryReplay"
 REPLAY_FUNCS = (
     "Engine.PlayerController:ClientUpdatePosition",
@@ -575,8 +574,9 @@ def _probe_flag_layout(pc: WillowPlayerController) -> None:
     can build a SavedMove ourselves, flip one flag at a time, and read which bit moves. Same answer,
     solo, deterministically, in one run.
 
-    The point of it is the free mask at the end: any bit no flag claims is a bit a slide marker can
-    occupy, which is what lets slide state ride the move stream rather than a side channel.
+    The free mask at the end reports which bits no flag claims. Read it as a description of the
+    packer, not as an invitation: a bit the game never writes says nothing about whether the server
+    reads it, and the flags byte is unpacked inside the server's own movement code.
     """
     if _Progress.probed_flag_layout:
         return
@@ -952,15 +952,15 @@ def _saved_move_count(pc: Any) -> str:
 
 
 def _applied_count() -> int:
-    """`hooks._Phys.applied` - how many times slide physics has been forced onto the local pawn.
+    """How many frames of slide physics have been forced onto a pawn, by any slide.
 
-    Imported lazily. `discovery` is imported before `hooks` in `__init__`, and a module-level import
-    here would invert that order for no benefit.
+    Imported lazily. `discovery` is imported before the movement modules in `__init__`, and a
+    module-level import here would invert that order for no benefit.
     """
     try:
-        from .hooks import _Phys  # noqa: PLC0415 - deliberately lazy, see docstring
+        from .movement import _PostLog  # noqa: PLC0415 - deliberately lazy, see docstring
 
-        return int(_Phys.applied)
+        return int(_PostLog.frames)
     except Exception:  # noqa: BLE001
         return -1
 
@@ -1425,8 +1425,8 @@ def enable() -> None:
 
     for name in SAVEDMOVE_FUNCS:
         try:
-            # Unconditional: the flag injector blocks this function on sliding moves, and a
-            # plain POST hook would therefore only ever see the moves we did not touch.
+            # Unconditional so the probe still fires on moves another hook has blocked, rather
+            # than only ever seeing the ones nothing touched.
             added = add_hook(name, Type.POST_UNCONDITIONAL, SAVEDMOVE_ID, _savedmove_flags_probe)
         except Exception as ex:  # noqa: BLE001
             note(f"SMOVE could not hook {name}: {type(ex).__name__}: {ex}")
