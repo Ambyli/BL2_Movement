@@ -18,7 +18,6 @@ from .hooks import (
     enable_phys_sliding,
 )
 from .lifecycle import network_functions
-from .moveflags import disable_move_flags, enable_move_flags
 
 # Wiring. Presentation subscribes here rather than being called from the slide logic, so movement
 # never needs to know what is watching it. Each future feature (HUD, audio, third-person pose) adds
@@ -34,13 +33,11 @@ events.slide_ended.append(discovery.on_end)
 
 def _on_enable() -> None:
     enable_phys_sliding()
-    enable_move_flags()
     discovery.enable()
 
 
 def _on_disable() -> None:
     discovery.disable()
-    disable_move_flags()
     disable_phys_sliding()
 
 

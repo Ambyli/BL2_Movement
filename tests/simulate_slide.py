@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from BL2_Movement import hooks, lifecycle, moveflags, movement
+from BL2_Movement import hooks, lifecycle, movement
 from BL2_Movement.config import SLIDE_SPEED_DEFAULT
 from BL2_Movement.state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, State
 
@@ -191,7 +191,6 @@ def _show_state(label: str, s) -> None:
 @pytest.fixture(autouse=True)
 def _wire_stubs(monkeypatch):
     monkeypatch.setattr(lifecycle, "is_client", _is_client_stub)
-    monkeypatch.setattr(moveflags, "is_client", _is_client_stub)
     # movement reads it too, to decide whether zeroing Acceleration is safe. Without this the
     # simulated client would run the host's branch and the sim would quietly stop modelling the
     # one difference between the two roles.
@@ -205,8 +204,6 @@ def _wire_stubs(monkeypatch):
     OWN_SLIDE_STATE.elapsed = 0.0
     OWN_SLIDE_STATE.old_z = 0.0
     CLIENTS_SLIDE_STATES.clear()
-    moveflags._Flags.last_seen.clear()  # noqa: SLF001
-    moveflags._Flags.injected = 0  # noqa: SLF001
     State.do_slide_jump = False
     _OwnStateSnapshot.machines.clear()
     _OwnStateSnapshot.active = "host"

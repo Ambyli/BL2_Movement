@@ -73,12 +73,14 @@ def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
 def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
     """Start, or restart, the host's copy of a player's slide. Idempotent.
 
-    Split out of the network message so the move-flag channel can drive it too. Both routes are
-    live at once and both land here; whichever arrives first wins and the other is a no-op, which is
-    what makes it safe to run them in parallel while we find out which is actually quicker.
+    Kept split from the network message, and kept idempotent, though only one route reaches it now.
+    A second route used to: a spare bit claimed in the move stream's CompressedFlags, which arrived
+    a frame or two sooner. It was removed because setting that bit dragged a sliding client toward
+    world origin with their own heading ignored - the bit was only ever *observed unused*, which
+    says BL2 never sets it and nothing at all about whether the server reads it. Bisecting the mod
+    switch by switch is what pinned it there. Do not reclaim a flag bit on that evidence again.
 
-    Runs on: HOST only. Callers are the broadcast RPC body (network route) and the move-flag read
-    hook in moveflags.py (in-stream route).
+    Runs on: HOST only. Sole caller is the broadcast RPC body.
 
     Returns True if this call was the one that started it.
     """
@@ -122,8 +124,7 @@ def begin_server_slide(pc: WillowPlayerController, source: str) -> bool:
 def end_server_slide(pc: WillowPlayerController, source: str) -> bool:
     """Stop the host's copy of a player's slide. Idempotent, for the same reason.
 
-    Runs on: HOST only. Same two callers as begin_server_slide: the broadcast RPC body and the
-    move-flag read hook (edge trigger when the slide bit clears).
+    Runs on: HOST only. Same sole caller as begin_server_slide: the broadcast RPC body.
     """
     # Bail on clients.
     if is_client():
@@ -215,7 +216,7 @@ def exit_slide(pc: WillowPlayerController) -> None:
     targeted RPC below when the host tells this client to stop.
     """
     # Not sliding? No-op. Idempotency matters: PlayerMove and client_exit_slide can fire on the
-    # same frame, and moveflags' correction path can also reach exit_slide indirectly.
+    # same frame.
     if not OWN_SLIDE_STATE.is_sliding:
         return
     # Clear the local flag first and unconditionally. Everything below is allowed to fail; this

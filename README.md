@@ -29,9 +29,9 @@ The mod hooks BL2's per-frame walking-physics function (`Engine.Pawn:PhysWalking
 
 Because the same hook runs on both machines, driven by the same inputs replicated through the normal move stream, the two simulations produce identical positions. This is functionally equivalent to what a native UE3 developer would do by adding a new `PHYS_Sliding` physics mode — we can't literally add an enum value from Python, but a PRE hook that blocks the native call and runs its own body is the same dispatch.
 
-Enter/exit is signalled two ways in parallel, and whichever arrives first wins (the other is a no-op via idempotency):
-- A `broadcast` RPC (`server_enter_slide` / `server_exit_slide`) — reliable but arrives tens of ms late.
-- A bit in `SavedMove.CompressedFlags` — travels with the move packet itself, applied on the exact move the client made the transition on.
+Enter/exit is signalled by a `broadcast` RPC (`server_enter_slide` / `server_exit_slide`). It is reliable but arrives tens of milliseconds late, so the host's copy of a slide starts and ends slightly behind the client's.
+
+A second, faster channel used to run alongside it: a spare bit claimed in `SavedMove.CompressedFlags`, which travels with the move packet and lands on the exact move the client made the transition on. **It has been removed.** Setting that bit dragged a sliding client toward world origin, ignoring the direction they set off in — visible to the client and to the host, on every build, and never reproducible while hosting. The bit was chosen by observing that BL2 never sets it during normal play, which establishes only that the game does not *write* it; whether the server *reads* it was never tested, and the flags byte is unpacked inside the server's own movement code. Bisecting the mod one switch at a time is what pinned it there. Don't reclaim a flag bit on that evidence again.
 
 The slide-jump keeps its momentum via a two-frame handoff: the local Jump hook stashes the current horizontal velocity, and the next PlayerMove PRE hook calls `pawn.DoJump(True)` on the ground frame and fires `server_set_slide_jump_velocity(vx, vy)` on the airborne frame.
 
