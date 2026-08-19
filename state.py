@@ -60,10 +60,10 @@ class PlayerSlideState:
     # Seconds this slide has been running, for the hard duration cap.
     elapsed: float = 0.0
     # Steering input this frame. On the machine that owns the slide the driver samples the pawn's
-    # Acceleration into these; on the host's copy of a remote slide they arrive from the owning
-    # client via `server_slide_input`. Read this rather than pawn.Acceleration in the physics so the
-    # two machines always agree on what the player is pressing, without depending on Unreal's
-    # Acceleration replication being fresh across a movement frame.
+    # Acceleration into these and its own physics reads them to steer. On the host's copy of a
+    # remote slide these stay at zero: the client ships its already-steered `dir_x/dir_y` via
+    # `server_slide_direction` after each of its physics ticks, and the host's steering branch
+    # keys off input magnitude and so stays inert when input is zero.
     input_x: float = 0.0
     input_y: float = 0.0
     # Slider-driven physics dials, snapshotted at slide open from the owning machine's
