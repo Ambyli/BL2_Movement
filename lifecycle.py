@@ -218,25 +218,37 @@ def exit_slide(pc: WillowPlayerController) -> None:
     # same frame, and moveflags' correction path can also reach exit_slide indirectly.
     if not OWN_SLIDE_STATE.is_sliding:
         return
-    # Clear local flag and restore normal crouch multiplier so residual motion decays with ordinary
-    # walking/crouching physics.
+    # Clear the local flag first and unconditionally. Everything below is allowed to fail; this
+    # line is what makes the failure recoverable, because a slide that is still flagged on refuses
+    # re-entry in enter_slide and leaves the player stuck in a slide they cannot restart.
     OWN_SLIDE_STATE.is_sliding = False
-    pc.Pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-    # Read final diagnostics for this slide - how many corrections the host suppressed on our
-    # behalf, how many positions the host adopted, and the worst gap ever seen between our claim
-    # and the server sim. All from the accumulators in debug.py.
-    adopted, worst = adopted_stats()
-    dbg(
-        f"EXIT client={is_client()} suppressed={suppressed_count()}"
-        f" adopted={adopted} worst_gap={worst:.0f}",
-    )
-    # Tell the host to stop tracking us. Once the host runs end_server_slide, the correction
-    # suppression hook stops blocking and any real disagreement can flow through as a normal
-    # ClientAdjustPosition. The move-flag route will independently reach the same conclusion on
-    # the next move that lacks the slide bit.
-    server_exit_slide()
-    # Notify subscribers - viewmodel returns weapon to resting pose.
-    events.fire(events.slide_ended, pc)
+
+    # The rest is wrapped so a raise can never skip the event fire in the `finally`. A None pawn
+    # here is routine - respawn and level transitions both reach this path - and letting that
+    # AttributeError escape would strand the weapon in its slide pose for the rest of the session,
+    # since nothing else ever calls the view model back.
+    try:
+        # Restore the normal crouch multiplier so residual motion decays with ordinary
+        # walking/crouching physics.
+        if (pawn := pc.Pawn) is not None:
+            pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
+        # Read final diagnostics for this slide - how many corrections the host suppressed on our
+        # behalf, how many positions the host adopted, and the worst gap ever seen between our
+        # claim and the server sim. All from the accumulators in debug.py.
+        adopted, worst = adopted_stats()
+        dbg(
+            f"EXIT client={is_client()} suppressed={suppressed_count()}"
+            f" adopted={adopted} worst_gap={worst:.0f}",
+        )
+        # Tell the host to stop tracking us. Once the host runs end_server_slide, the correction
+        # suppression hook stops blocking and any real disagreement can flow through as a normal
+        # ClientAdjustPosition. The move-flag route will independently reach the same conclusion on
+        # the next move that lacks the slide bit.
+        server_exit_slide()
+    finally:
+        # Notify subscribers - viewmodel returns weapon to resting pose. In the `finally` because
+        # the view model getting stuck on is the single most visible way this function can fail.
+        events.fire(events.slide_ended, pc)
 
 
 @targeted.message

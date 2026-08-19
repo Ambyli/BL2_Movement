@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from mods_base import get_pc, hook
 from uemath import Vector
@@ -11,12 +11,105 @@ from unrealsdk import unreal
 from unrealsdk.hooks import Block, Type, add_hook, remove_hook
 
 from .debug import dbg
-from .lifecycle import client_exit_slide, enter_slide, server_set_slide_jump_velocity
-from .movement import apply_slide_physics, slide
-from .state import CLIENTS_SLIDE_STATES, OWN_SLIDE_STATE, PlayerSlideState, State
+from .lifecycle import (
+    client_exit_slide,
+    enter_slide,
+    exit_slide,
+    server_set_slide_jump_velocity,
+)
+from .movement import apply_slide_physics, can_slide, slide
+from .state import (
+    CLIENTS_SLIDE_STATES,
+    OWN_SLIDE_STATE,
+    PlayerSlideState,
+    State,
+    world_time,
+)
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
+
+
+# --- shared frame bookkeeping ---------------------------------------------------------------------
+
+
+class _Phys:
+    """Cross-hook scratch shared by the two integration paths.
+
+    `last_frame` is the world time of the last frame `_phys_sliding` handled the *local* player.
+    `enforce_slide` reads it to stand down on frames PhysWalking already covered. `last_delta` is
+    the last positive frame delta we saw, used only when a hook's own delta cannot be read.
+    """
+
+    reported: ClassVar[bool] = False
+    last_frame: ClassVar[float] = -1.0
+    last_delta: ClassVar[float] = 0.0
+    last_world_time: ClassVar[float] = -1.0
+
+    @staticmethod
+    def now() -> float:
+        """World time, or -1.0 if the world is not currently readable.
+
+        Mid-load and mid-transition there is no world info to read. -1.0 never equals a stamped
+        frame, so a failure here makes the dedup say "not handled", which costs at most one
+        redundant physics write - the safe direction, versus silently skipping the only integrator.
+        """
+        try:
+            return world_time()
+        except Exception:  # noqa: BLE001 - no world yet
+            return -1.0
+
+    @classmethod
+    def mark_local_frame(cls) -> None:
+        """Record that PhysWalking drove the local player's slide on this frame."""
+        cls.last_frame = cls.now()
+
+    @classmethod
+    def handled_local_frame(cls) -> bool:
+        """Whether PhysWalking already drove the local player's slide on this frame."""
+        return cls.last_frame >= 0.0 and cls.last_frame == cls.now()
+
+
+def _arg_names(args: unreal.WrappedStruct) -> list[str]:
+    """Every parameter name on a hook's args struct, for the one-shot probe below.
+
+    Worth the awkwardness because the alternative is guessing. The physics rework read
+    `getattr(args, "DeltaTime", 0.0)` and returned early on the 0.0 default, so a parameter named
+    anything else - `deltaTime`, as UE3's C++ signature spells it - produced a hook that fired every
+    frame and did nothing, with no log line to say so.
+    """
+    try:
+        return [str(field.Name) for field in args._type._fields()]
+    except Exception:  # noqa: BLE001 - a probe must never raise at its call site
+        try:
+            return [name for name in dir(args) if not name.startswith("_")]
+        except Exception:  # noqa: BLE001
+            return []
+
+
+def _delta_from(args: unreal.WrappedStruct) -> float:
+    """This frame's delta in seconds, however the hook happens to spell it.
+
+    Falls back to differencing world time, and then to the last positive delta we saw - the latter
+    covering the host running this for several pawns inside one frame, where the world-time
+    difference is zero for every pawn after the first.
+    """
+    for name in ("DeltaTime", "deltaTime"):
+        try:
+            delta = float(getattr(args, name))
+        except Exception:  # noqa: BLE001, S112 - wrong spelling is the expected case, not news
+            continue
+        if delta > 0.0:
+            _Phys.last_delta = delta
+            return delta
+
+    now = _Phys.now()
+    delta = now - _Phys.last_world_time
+    _Phys.last_world_time = now
+    if 0.0 < delta < 1.0:
+        _Phys.last_delta = delta
+        return delta
+    return _Phys.last_delta
 
 
 @hook("WillowGame.WillowPlayerInput:Jump")
@@ -45,34 +138,102 @@ def jump(
 @hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove")
 def handle_move(
     obj: unreal.UObject,
-    _args: unreal.WrappedStruct,
+    args: unreal.WrappedStruct,
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """PRE hook on the walking-state per-frame move - now only handles the slide-jump handoff.
+    """PRE hook on the walking-state per-frame move. Owns the local slide's clock.
 
-    Runs on: BOTH host and client. All slide integration, decay, and exit-condition work has moved
-    into the PhysWalking PRE hook (`_phys_sliding`). What remains here is the two-frame slide-jump
-    dance: when Jump was pressed while sliding, the jump hook stashes horizontal velocity and sets
-    `State.do_slide_jump`. On this frame's PlayerMove PRE, if we are still grounded we fire
-    `DoJump(True)` to leave the ground; on the next fire (once airborne), we broadcast the stashed
-    velocity to the host so its copy of the pawn keeps the momentum through the arc.
+    This hook is the one place the local slide is guaranteed to be advanced and to be ended. It is
+    deliberately not `_phys_sliding`: a slide whose only clock lives in a hook that might not
+    dispatch is a slide that runs forever, which is exactly what shipped in the physics rework -
+    `PhysWalking` registered fine and then never did a frame of work, so nothing decayed and no exit
+    condition was ever reached. PlayerMove is proven to fire; the clock lives here.
+
+    Two other jobs. The slide-jump handoff spans two frames by nature: the Jump hook stashes
+    horizontal velocity and sets `State.do_slide_jump`, then on this frame we `DoJump(True)` to
+    leave the ground, and on the next fire (now airborne) we hand the stashed velocity to the host
+    so its copy of the pawn keeps the momentum through the arc. And the physical exit gate -
+    crouch released, or no longer on the ground - runs here through `can_slide`.
+
+    Runs on: BOTH host and client, for the local player only. Remote pawns never run PlayerMove on
+    this machine; the host advances their slides from `_phys_sliding` instead.
     """
-    if not State.do_slide_jump:
-        return
-
     pc = cast("WillowPlayerController", obj)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
     if pawn is None:
         return
 
-    if pawn.IsOnGroundOrShortFall():
-        pawn.DoJump(True)
-    else:
-        server_set_slide_jump_velocity(
-            State.horizontal_velocity.x, State.horizontal_velocity.y,
-        )
-        State.do_slide_jump = False
+    # Jumping stands you up, which fails `can_slide` below, so the slide jump has to be settled
+    # before any exit condition gets a chance to run. Leaving the ground ends the slide on the
+    # *following* frame, by which point the momentum is already in the pawn's velocity.
+    if State.do_slide_jump:
+        if pawn.IsOnGroundOrShortFall():
+            pawn.DoJump(True)
+        else:
+            server_set_slide_jump_velocity(
+                State.horizontal_velocity.x, State.horizontal_velocity.y,
+            )
+            State.do_slide_jump = False
+        return
+
+    if not OWN_SLIDE_STATE.is_sliding:
+        return
+
+    # Physical exit conditions: crouch released, or off the ground. Called directly rather than
+    # through `client_exit_slide`, which for the local player would be a queued network message to
+    # itself - delivered a tick later, one message per player tick.
+    if not can_slide(pc, pawn):
+        exit_slide(pc)
+        return
+
+    # Advance the decay curve. `_phys_sliding` deliberately does not do this for the local player,
+    # so there is no double-decay to guard against here whichever order the two hooks run in.
+    delta_time = _delta_from(args)
+    if delta_time <= 0.0:
+        return
+    if slide(pc, OWN_SLIDE_STATE, delta_time):
+        exit_slide(pc)
+
+
+@hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove", Type.POST)
+def enforce_slide(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """Fallback integrator: force the slide onto the pawn once PlayerMove has recomputed movement.
+
+    This is the pre-rework path, kept alive alongside `_phys_sliding` because we do not yet know
+    which of the two the engine actually gives us. It writes velocity and lets native PhysWalking
+    integrate it, where `_phys_sliding` blocks PhysWalking and integrates itself - so exactly one of
+    them may run on any given frame. `_phys_sliding` stamps `_Phys.last_frame` when it handles the
+    local player, and this hook stands down for that frame. POST PlayerMove runs after PhysWalking,
+    so that stamp is always already in place by the time we read it.
+
+    Once the log settles which path is live, the other one comes out.
+
+    Runs on: BOTH, local player only.
+    """
+    if not OWN_SLIDE_STATE.is_sliding:
+        return
+    # PhysWalking already did this frame - anything we wrote now would be a second application.
+    if _Phys.handled_local_frame():
+        return
+    pc = cast("WillowPlayerController", obj)
+    pawn = cast("WillowPlayerPawn", pc.Pawn)
+    if pawn is None:
+        return
+    delta_time = _delta_from(args)
+    if delta_time <= 0.0:
+        return
+    # A failure here would leave the slide state advancing with no visible motion at all. Log it
+    # rather than raise, so a bug in the physics can't take the whole movement path down with it.
+    try:
+        apply_slide_physics(pawn, OWN_SLIDE_STATE, delta_time)
+    except Exception as ex:  # noqa: BLE001 - never break the move path
+        dbg(f"ENFORCE FAILED {type(ex).__name__}: {ex}")
 
 
 @hook("WillowGame.WillowPlayerInput:DuckPressed")
@@ -144,10 +305,23 @@ def _phys_sliding(
 ) -> type[Block] | None:
     """Slide-physics PRE hook. Returns Block to skip native PhysWalking when the pawn is sliding.
 
-    Runs on: BOTH. Fires per-frame on every pawn whose walking-physics is about to run. Pawns that
-    are not sliding fall through to native PhysWalking (return None); sliding pawns get their
-    physics computed here and PhysWalking is skipped entirely.
+    Runs on: BOTH. Fires per-frame on every pawn whose walking-physics is about to run - if the
+    engine dispatches it through script at all, which the probe below exists to establish. Pawns
+    that are not sliding fall through to native PhysWalking (return None); sliding pawns get their
+    physics computed and integrated here and PhysWalking is skipped entirely.
+
+    It owns the decay clock for *remote* pawns only. The local player's clock lives in `handle_move`
+    on a hook we know fires, so that a slide can never outlive its duration just because this one
+    turned out to be inert.
     """
+    # One-shot probe, fired before every early return below. Its presence or absence in the log is
+    # the whole answer to whether the engine dispatches PhysWalking through script at all, and its
+    # parameter list settles what the frame delta is actually called. The rework shipped without
+    # this and cost a session's play time to a hook that was silently inert.
+    if not _Phys.reported:
+        _Phys.reported = True
+        dbg(f"PHYS fired args={_arg_names(args)}")
+
     pawn = cast("WillowPlayerPawn", obj)
     pc = getattr(pawn, "Controller", None)
     if pc is None:
@@ -157,19 +331,22 @@ def _phys_sliding(
     if state is None:
         return None
 
-    try:
-        delta_time = float(getattr(args, "DeltaTime", 0.0) or 0.0)
-    except Exception:  # noqa: BLE001
-        return None
+    delta_time = _delta_from(args)
     if delta_time <= 0.0:
         return None
 
+    is_local = state is OWN_SLIDE_STATE
+
     try:
-        # Decay speed_pct against the slope, and fire the targeted exit RPC if the floor is hit.
-        # slide() may set state.is_sliding to False; check afterwards before continuing.
-        slide(pc, state, delta_time)
-        if not state.is_sliding:
-            return None
+        # The local player's clock belongs to handle_move (PRE PlayerMove), which is guaranteed to
+        # fire; advancing it again here would decay every local slide at double rate. Remote pawns
+        # have no PlayerMove on this machine, so for those the host's clock is this hook.
+        if not is_local:
+            if slide(pc, state, delta_time):
+                # `targeted`, so this reaches the one client that owns the slide.
+                client_exit_slide(pc.PlayerReplicationInfo)
+            if not state.is_sliding:
+                return None
 
         # Fallback heading lock. begin_slide_state on the host reads its own simulated pawn.Velocity
         # which can be stale on the first frame - if it was below the 1uu/s floor, dir/entry got
@@ -197,8 +374,13 @@ def _phys_sliding(
             (float(vel.X) * delta_time, float(vel.Y) * delta_time, 0.0),
         )
 
-        # Extra exit condition: duck released. slide() already checks speed floor and duration cap.
-        if not bool(getattr(pc, "bDuck", False)):
+        # Tell enforce_slide to stand down for this frame - we have both written the velocity and
+        # integrated it, and it would otherwise write a second time after PlayerMove returns.
+        if is_local:
+            _Phys.mark_local_frame()
+        # Extra exit condition for remote pawns: their crouch released. The local player's copy of
+        # this check lives in handle_move's can_slide gate.
+        elif not bool(getattr(pc, "bDuck", False)):
             client_exit_slide(pc.PlayerReplicationInfo)
     except Exception as ex:  # noqa: BLE001 - defensive: on failure, fall back to native walking
         dbg(f"PHYS SLIDING FAILED {type(ex).__name__}: {ex}")
@@ -227,4 +409,4 @@ def disable_phys_sliding() -> None:
 
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
-all_hooks = [handle_move, handle_duck, jump]
+all_hooks = [handle_move, enforce_slide, handle_duck, jump]

@@ -4,6 +4,11 @@ Both machines run the same slide-physics code out of hooks._phys_sliding, so the
 by calling that hook on both a client-side pawn and a host-side pawn once per frame. If the design
 holds, they end up in identical positions on every frame and no server correction ever fires.
 
+Note what this file cannot tell you, and did not tell us: it calls `_phys_sliding` directly, so it
+is silent on whether the engine ever calls it. The build where PhysWalking never dispatched passed
+this simulation on every frame. `tests/test_termination.py` covers the outcome instead - that the
+slide stops and the view model comes back - through the hook we know fires.
+
 Run with:
     uv run --no-sync pytest tests/simulate_slide.py -s
 """
@@ -270,11 +275,16 @@ def test_simulate_client_slide() -> None:
     for frame in range(1, 6):
         _hdr(f"FRAME {frame}")
 
-        # CLIENT: run _phys_sliding on Alice's pawn.
+        # CLIENT: run the local player's frame the way production runs it - handle_move first
+        # (PRE PlayerMove: decay clock and exit gate), then _phys_sliding (integration). The clock
+        # deliberately does not live in _phys_sliding for the local player, so a sim that only
+        # called _phys_sliding would show a slide that never decays and never ends.
         _switch_role("client", client_pc)
         # Simulate input: forward key held.
         client_pawn.Acceleration.X = 1.0
         client_pawn.Acceleration.Y = 0.0
+        hooks.handle_move(client_pc, _phys_walking_args(dt), None, None)
+        assert OWN_SLIDE_STATE.is_sliding, "client slide ended early"
         result = hooks._phys_sliding(  # noqa: SLF001
             client_pawn, _phys_walking_args(dt), None, None,
         )

@@ -21,12 +21,26 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 # --- import path -----------------------------------------------------------------------------------
-# Add the repo's parent dir so `from BL2_Movement import state` works. The mod uses relative imports
-# (`from .config import ...`), so it must be imported as a package rather than as loose modules.
+# The mod uses relative imports (`from .config import ...`), so it has to be imported as a package
+# rather than as loose modules. The tests spell that package `BL2_Movement`, after the GitHub repo -
+# but the same code is checked out as `sliding` inside the game's `sdk_mods`, and a GitHub zip
+# extracts as `BL2_Movement-main`. Depending on the directory name meant the suite simply refused to
+# collect in the game folder, which is the copy actually being played and therefore the copy whose
+# regressions matter. This is the same lesson as PROTOCOL_PREFIX in lifecycle.py: pin the name to
+# the mod, not to wherever somebody happened to put it.
+#
+# Binding `__path__` rather than importing the real package is deliberate - it makes submodules
+# resolve out of this directory without executing `__init__.py`, which would build the mod and wire
+# up hooks as an import side effect.
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO.parent) not in sys.path:
     sys.path.insert(0, str(_REPO.parent))
+
+if "BL2_Movement" not in sys.modules:
+    _package = ModuleType("BL2_Movement")
+    _package.__path__ = [str(_REPO)]  # type: ignore[attr-defined]
+    sys.modules["BL2_Movement"] = _package
 
 
 # --- uemath.Vector — real math, not a mock ---------------------------------------------------------
@@ -287,3 +301,16 @@ _install(
 # Declared as a runtime dep but not actually imported by the code paths under test.
 
 _install("coroutines")
+
+
+# --- debug log redirect ------------------------------------------------------------------------------
+# `debug.dbg` appends to a file in the user's home directory, and several code paths under test call
+# it. Left alone, running the suite interleaves test noise into the *live game's* diagnostic log -
+# the one artifact we rely on to tell what the mod did in a real session, and which has a 4000 line
+# budget that test runs would quietly spend. Point it somewhere disposable instead.
+
+import tempfile  # noqa: E402
+
+from BL2_Movement import debug as _debug  # noqa: E402
+
+_debug.LOG_PATH = Path(tempfile.gettempdir()) / "bl2_slide_debug_tests.log"

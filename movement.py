@@ -19,7 +19,6 @@ from .config import (
     steer_rate,
 )
 from .debug import dbg
-from .lifecycle import client_exit_slide
 from .state import OWN_SLIDE_STATE, PlayerSlideState
 
 if TYPE_CHECKING:
@@ -60,16 +59,20 @@ def slide(
     pc: WillowPlayerController,
     slide_data: PlayerSlideState,
     delta_time: float,
-) -> None:
-    """Advance the decay curve and decide when the slide is spent. Called every frame.
+) -> bool:
+    """Advance the decay curve and report whether the slide is spent. Called every frame.
 
-    Owns nothing else: heading and velocity are applied in `apply_slide_physics`, from a post hook,
-    where PlayerMove can no longer overwrite them.
+    Owns nothing else: heading and velocity are applied in `apply_slide_physics`, and ending the
+    slide is the caller's job. Returning the verdict rather than acting on it is what lets the two
+    callers end a slide the way that suits them - `handle_move` calls `exit_slide` directly for the
+    local player, while `_phys_sliding` sends the targeted RPC for a remote one. Dispatching from
+    in here meant the local player's own exit took a queued network round-trip to itself, one
+    message per player tick, to say something it already knew.
 
-    Runs on: BOTH. Called from the client's `handle_move` (PRE PlayerMove) for its own slide, from
-    the host's `drive_hosted_slides` for the host's own slide entry, and from the host's
-    `_drive_remote_slide` (POST MoveAutonomous) for remote clients. The exit trigger fires a
-    targeted RPC back to whichever machine owns the slide.
+    Runs on: BOTH. Called from `hooks.handle_move` (PRE PlayerMove) for the local slide, and from
+    `hooks._phys_sliding` for whichever pawn that hook is running against.
+
+    Returns True when the slide is spent and the caller should end it.
     """
     # Height difference against last frame, in unreal units.
     z_diff: float = pc.Pawn.Location.Z - slide_data.old_z
@@ -93,12 +96,8 @@ def slide(
     slide_data.speed_pct = speed
     slide_data.elapsed += delta_time
 
-    # Exit triggers: either the decay bled below the walking-crouch floor or the duration cap has
-    # hit. The RPC is `targeted`, so calling it from the host reaches the specific client that
-    # owns this slide; calling it from the client with its own PRI is a same-machine invocation
-    # that lands in `client_exit_slide` locally.
-    if speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= max_duration.value:
-        client_exit_slide(pc.PlayerReplicationInfo)
+    # Exit verdict: either the decay bled below the walking-crouch floor, or the duration cap hit.
+    return speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= max_duration.value
 
 
 def apply_slide_physics(
