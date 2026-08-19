@@ -199,3 +199,38 @@ def test_speed_scales_with_speed_pct():
 
     expected = start_speed.value * 0.5
     assert math.hypot(pawn.Velocity.X, pawn.Velocity.Y) == pytest.approx(expected)
+
+
+# --- acceleration is the client's only outgoing steering signal --------------------------------------
+
+
+def test_acceleration_is_zeroed_when_we_are_the_authority(monkeypatch):
+    """Host or single player: nothing downstream depends on Acceleration, so clear it."""
+    monkeypatch.setattr(movement, "is_client", lambda: False)
+    pawn = _pawn(ax=1.0, ay=0.0)
+    movement.apply_slide_physics(pawn, _state(), delta_time=1 / 60)
+
+    assert pawn.Acceleration.X == 0.0
+    assert pawn.Acceleration.Y == 0.0
+
+
+def test_acceleration_is_preserved_on_a_client(monkeypatch):
+    """On a client, Acceleration is what the ServerMove packet carries about our heading - the host
+    steers its copy of our pawn by it and by nothing else. Wiping it left the host guessing, which
+    is what made a client's slide run off along a fixed bearing regardless of where they set off.
+    """
+    monkeypatch.setattr(movement, "is_client", lambda: True)
+    pawn = _pawn(ax=0.6, ay=-0.8)
+    movement.apply_slide_physics(pawn, _state(), delta_time=1 / 60)
+
+    assert (pawn.Acceleration.X, pawn.Acceleration.Y) == (0.6, -0.8)
+
+
+def test_velocity_is_still_forced_on_a_client(monkeypatch):
+    """Keeping Acceleration must not cost us the forced velocity - that is the slide itself."""
+    monkeypatch.setattr(movement, "is_client", lambda: True)
+    pawn = _pawn()
+    movement.apply_slide_physics(pawn, _state(dir_x=1.0, dir_y=0.0), delta_time=1 / 60)
+
+    assert pawn.Velocity.X > 0.0
+    assert pawn.Velocity.Y == 0.0

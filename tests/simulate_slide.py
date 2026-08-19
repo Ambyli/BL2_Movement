@@ -192,6 +192,10 @@ def _show_state(label: str, s) -> None:
 def _wire_stubs(monkeypatch):
     monkeypatch.setattr(lifecycle, "is_client", _is_client_stub)
     monkeypatch.setattr(moveflags, "is_client", _is_client_stub)
+    # movement reads it too, to decide whether zeroing Acceleration is safe. Without this the
+    # simulated client would run the host's branch and the sim would quietly stop modelling the
+    # one difference between the two roles.
+    monkeypatch.setattr(movement, "is_client", _is_client_stub)
     monkeypatch.setattr(hooks, "get_pc", _get_pc_stub)
 
     OWN_SLIDE_STATE.is_sliding = False
