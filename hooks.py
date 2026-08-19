@@ -105,7 +105,9 @@ def _delta_from(args: unreal.WrappedStruct) -> float:
     for name in ("DeltaTime", "deltaTime"):
         try:
             delta = float(getattr(args, name))
-        except Exception:  # noqa: BLE001, S112 - wrong spelling is the expected case, not news
+        except (
+            Exception
+        ):  # noqa: BLE001, S112 - wrong spelling is the expected case, not news
             continue
         if delta > 0.0:
             _Phys.last_delta = delta
@@ -180,7 +182,8 @@ def handle_move(
             pawn.DoJump(True)
         else:
             server_set_slide_jump_velocity(
-                State.horizontal_velocity.x, State.horizontal_velocity.y,
+                State.horizontal_velocity.x,
+                State.horizontal_velocity.y,
             )
             State.do_slide_jump = False
         return
@@ -282,9 +285,7 @@ def handle_duck(
 # AutonomousPhysics -> PhysWalking), one hook covers both machines' paths.
 
 PHYS_SLIDING_ID = "SlidingPhysWalking"
-PHYS_SLIDING_FUNCS = (
-    "Engine.Pawn:PhysWalking",
-)
+PHYS_SLIDING_FUNCS = ("Engine.Pawn:PhysWalking",)
 
 
 def _state_for_pawn(pc: unreal.UObject) -> PlayerSlideState | None:
@@ -306,105 +307,14 @@ def _state_for_pawn(pc: unreal.UObject) -> PlayerSlideState | None:
     return None
 
 
-def _phys_sliding(
-    obj: unreal.UObject,
-    args: unreal.WrappedStruct,
-    _ret: Any,
-    _func: unreal.BoundFunction,
-) -> type[Block] | None:
-    """Slide-physics PRE hook. Returns Block to skip native PhysWalking when the pawn is sliding.
-
-    Runs on: BOTH. Fires per-frame on every pawn whose walking-physics is about to run - if the
-    engine dispatches it through script at all, which the probe below exists to establish. Pawns
-    that are not sliding fall through to native PhysWalking (return None); sliding pawns get their
-    physics computed and integrated here and PhysWalking is skipped entirely.
-
-    It owns the decay clock for *remote* pawns only. The local player's clock lives in `handle_move`
-    on a hook we know fires, so that a slide can never outlive its duration just because this one
-    turned out to be inert.
-    """
-    # One-shot probe, fired before every early return below. Its presence or absence in the log is
-    # the whole answer to whether the engine dispatches PhysWalking through script at all, and its
-    # parameter list settles what the frame delta is actually called. The rework shipped without
-    # this and cost a session's play time to a hook that was silently inert.
-    if not _Phys.reported:
-        _Phys.reported = True
-        dbg(f"PHYS fired args={_arg_names(args)}")
-
-    pawn = cast("WillowPlayerPawn", obj)
-    pc = getattr(pawn, "Controller", None)
-    if pc is None:
-        return None
-
-    state = _state_for_pawn(pc)
-    if state is None:
-        return None
-
-    delta_time = _delta_from(args)
-    if delta_time <= 0.0:
-        return None
-
-    is_local = state is OWN_SLIDE_STATE
-
-    try:
-        # The local player's clock belongs to handle_move (PRE PlayerMove), which is guaranteed to
-        # fire; advancing it again here would decay every local slide at double rate. Remote pawns
-        # have no PlayerMove on this machine, so for those the host's clock is this hook.
-        if not is_local:
-            if slide(pc, state, delta_time):
-                # `targeted`, so this reaches the one client that owns the slide.
-                client_exit_slide(pc.PlayerReplicationInfo)
-            if not state.is_sliding:
-                return None
-
-        # Fallback heading lock. begin_slide_state on the host reads its own simulated pawn.Velocity
-        # which can be stale on the first frame - if it was below the 1uu/s floor, dir/entry got
-        # left at (0,0). By the time PhysWalking fires, pawn.Velocity has been replicated at least
-        # once from BL2's normal pawn stream and is a truer sample. Use it to lock heading now.
-        if state.dir_x == 0.0 and state.dir_y == 0.0:
-            vel = Vector(pawn.Velocity)
-            vel.z = 0
-            if vel.magnitude >= 1.0:
-                vel.normalize()
-                state.dir_x = vel.x
-                state.dir_y = vel.y
-                state.entry_x = vel.x
-                state.entry_y = vel.y
-
-        # Steer (with back-cutoff + turn-cone clamp) and write Velocity/Acceleration/CrouchedPct
-        # onto the pawn. Same math as the previous POST-hook enforce_slide path, minus the
-        # post-integration assumption - we integrate ourselves next.
-        apply_slide_physics(pawn, state, delta_time)
-
-        # Integrate: move the pawn using the engine's own collision. MoveSmooth handles wall-slide
-        # and step-up so we do not have to trace collision manually.
-        vel = pawn.Velocity
-        pawn.MoveSmooth(
-            (float(vel.X) * delta_time, float(vel.Y) * delta_time, 0.0),
-        )
-
-        # Tell enforce_slide to stand down for this frame - we have both written the velocity and
-        # integrated it, and it would otherwise write a second time after PlayerMove returns.
-        if is_local:
-            _Phys.mark_local_frame()
-            _Phys.applied += 1
-        # Extra exit condition for remote pawns: their crouch released. The local player's copy of
-        # this check lives in handle_move's can_slide gate.
-        elif not bool(getattr(pc, "bDuck", False)):
-            client_exit_slide(pc.PlayerReplicationInfo)
-    except Exception as ex:  # noqa: BLE001 - defensive: on failure, fall back to native walking
-        dbg(f"PHYS SLIDING FAILED {type(ex).__name__}: {ex}")
-        return None
-
-    return Block
-
-
 def enable_phys_sliding() -> None:
     """Wire the PhysWalking PRE hook. Runs on: BOTH, at mod-enable."""
     for name in PHYS_SLIDING_FUNCS:
         try:
             added = add_hook(name, Type.PRE, PHYS_SLIDING_ID, _phys_sliding)
-        except Exception as ex:  # noqa: BLE001 - if PhysWalking can't be hooked, log and continue
+        except (
+            Exception
+        ) as ex:  # noqa: BLE001 - if PhysWalking can't be hooked, log and continue
             dbg(f"PHYS SLIDING could not hook {name}: {type(ex).__name__}: {ex}")
             continue
         dbg(f"PHYS SLIDING hook on {name}: {'added' if added else 'refused'}")

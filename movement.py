@@ -52,7 +52,9 @@ def can_slide(pc: WillowPlayerController, pawn: WillowPlayerPawn) -> bool:
     per-frame exit gate. Note that it checks OWN_SLIDE_STATE, not the shared dict - this only
     speaks about the local player, never remote ones.
     """
-    return OWN_SLIDE_STATE.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
+    return (
+        OWN_SLIDE_STATE.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
+    )
 
 
 def slide(
@@ -167,22 +169,11 @@ def apply_slide_physics(
 
     # Forcing the pawn state. CrouchedPct is held clear of the actual slide speed so the engine's
     # cap (CrouchedPct * GroundSpeed) can't clamp us; Velocity carries the actual forced motion.
-    pawn.CrouchedPct = max(SLIDE_SPEED_DEFAULT, (speed / max(pawn.GroundSpeed, 1.0)) * 2.0)
+    pawn.CrouchedPct = max(
+        SLIDE_SPEED_DEFAULT, (speed / max(pawn.GroundSpeed, 1.0)) * 2.0
+    )
     pawn.Velocity.X = direction.x * speed
     pawn.Velocity.Y = direction.y * speed
-
-    # Zeroing Acceleration stops PhysWalking fighting the velocity write - but only do it where we
-    # are the authority. On a client, Acceleration is not scratch space: it is the one directional
-    # value the ServerMove packet carries about us, and the host steers its copy of our pawn by it
-    # and nothing else. Wiping it every frame left the host with no idea where we were going, so it
-    # kept moving us along some fixed bearing of its own and corrected us onto it ~33 times a
-    # second - which is why a client's slide ignored the direction they set off in while the exact
-    # same code looked perfect for whoever was hosting. Measured, not guessed: the PATH probe read
-    # accel=(none) on 90 of 90 client samples, and the host's log ran a client's whole slide without
-    # a single frame of slide physics.
-    if not is_client():
-        pawn.Acceleration.X = 0.0
-        pawn.Acceleration.Y = 0.0
 
     # Throttled deliberately. Logging this every frame burned 391 of the debug log's 400 lines on
     # two slides and silently dropped the whole of the next session - the rare lines are the ones
