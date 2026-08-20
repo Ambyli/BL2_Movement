@@ -7,15 +7,12 @@ of it, and carry its momentum across.
 
 from __future__ import annotations
 
-import math
-
 from typing import TYPE_CHECKING, Any, cast
 
 from mods_base import hook
 from uemath import Vector
 from unrealsdk import unreal
 
-from .config import CROUCHED_PCT_DEFAULT
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
 from .state import OWN_SLIDE_STATE, State, is_client, player_id, state_for
@@ -126,54 +123,87 @@ def handle_duck(
 
 
 # DIAGNOSTIC (temporary) --------------------------------------------------------------------------
-# Direction-authority test. We proved the server's MoveAutonomous drives a remote proxy at
-# GroundSpeed * CrouchedPct along the REPLICATED Acceleration (the client's raw input). B* needs the
-# proxy to follow the SLIDE HEADING instead, which differs from input whenever the player steers or
-# holds nothing. This tests whether the HOST can dictate that direction: in the MoveAutonomous
-# pre-hook we overwrite Pawn.Acceleration with a heading deliberately DIFFERENT from what the client
-# is pressing, then watch which way the resulting server-side velocity actually goes.
-#   - client pressing something: forced dir = perpendicular to their input.
-#   - client pressing nothing:   forced dir = a fixed world axis (also tests "can the host move a
-#                                zero-input proxy at all?", the core no-input slide case).
-# Read DIR_AUTH's angles (of the observed velocity, i.e. LAST tick's physics under the accel we set):
-#   ang_forced -> 0, ang_client -> 90  => host CONTROLS direction; option (a) works, branch is ~40
-#                                          host-only lines.
-#   ang_client -> 0, ang_forced -> 90  => MoveAutonomous overwrote our Acceleration from the move
-#                                          param; host cannot steer -> need option (b) (client forces
-#                                          its outgoing move to carry the slide heading).
-#   zero-input + speed>0 along forced  => host can drive a no-input proxy; strongly favors (a).
-# Isolated to a ducking, non-sliding remote pawn on the host, so it never touches an active slide.
-# Lifting the cap + forcing a cross direction makes that player veer/rubber-band - expected, it is
-# the test. Have the remote client crouch-WALK (steady input, then also try releasing all keys).
-_PROBE_CAP: float = 3.0
-_FORCE_MAG: float = 2048.0  # full-input Acceleration magnitude observed on the wire
-_cap_lifted: set[int] = set()
-_last_forced: dict[int, tuple[float, float]] = {}
-_last_client: dict[int, tuple[float, float]] = {}
+# Client-side injection test. Option (a) is dead - the host cannot steer a remote proxy; its
+# direction (and whether it moves at all) comes solely from the client's replicated Acceleration. So
+# B* needs the CLIENT to make its OUTGOING move carry the slide heading. This tests whether we can
+# inject that. On the client, during crouch-walk (no mod slide), we override the outgoing heading to
+# a fixed "full forward" via (1) the input axes and (2) Pawn.Acceleration directly; on the host we
+# OBSERVE the replicated client_dir. Decisive run: crouch-walk while pressing NOTHING -
+#   host sees client_dir != 0 (motion the player never pressed) -> injection reaches the wire; B* works
+#   host sees client_dir == 0                                    -> this injection point does not stick
+# We also log which input-axis fields actually exist (names vary across builds) to wire the real
+# slide injection next. The client will lurch forward against your input during the test - expected.
+_INJECT_MAG: float = 2048.0
+_AXIS_CANDIDATES: tuple[str, ...] = ("aForward", "aStrafe", "aBaseX", "aBaseY", "aUp", "aTurn", "aLookUp")
+_axes_discovered: bool = False
 
 
-def _angle_deg(ax: float, ay: float, bx: float, by: float) -> float:
-    """Unsigned angle between two ground vectors, or -1 if either is ~zero."""
-    ma = math.hypot(ax, ay)
-    mb = math.hypot(bx, by)
-    if ma < 1e-6 or mb < 1e-6:
-        return -1.0
-    c = max(-1.0, min(1.0, (ax * bx + ay * by) / (ma * mb)))
-    return math.degrees(math.acos(c))
+@hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove")
+def probe_client_inject(
+    obj: unreal.UObject,
+    _args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """CLIENT: force the outgoing move heading during crouch-walk, to test if it replicates.
+
+    Runs on: CLIENT only, for the local player, while ducking and not in a mod slide. PRE-hook, so
+    axis writes land before PlayerMove reads them to compute this frame's Acceleration.
+    """
+    if not is_client():
+        return
+    pc = cast("WillowPlayerController", obj)
+    if not bool(pc.bDuck) or OWN_SLIDE_STATE.is_sliding:
+        return
+    pawn = cast("WillowPlayerPawn", pc.Pawn)
+    if pawn is None:
+        return
+    pin = getattr(pc, "PlayerInput", None)
+
+    global _axes_discovered  # noqa: PLW0603 - one-shot discovery latch
+    if not _axes_discovered and pin is not None:
+        _axes_discovered = True
+        found: list[str] = []
+        for name in _AXIS_CANDIDATES:
+            try:
+                found.append(f"{name}={float(getattr(pin, name)):.2f}")
+            except Exception:  # noqa: BLE001 - probing which axis fields exist
+                pass
+        log.info(f"INJECT_DISCOVER axes=[{', '.join(found)}]")
+
+    # (1) Input-axis injection: force full forward / no strafe, overriding real input. Names vary, so
+    # set whichever exist.
+    set_axes: list[str] = []
+    if pin is not None:
+        for name, val in (("aForward", 1.0), ("aBaseY", 1.0), ("aStrafe", 0.0), ("aBaseX", 0.0)):
+            try:
+                setattr(pin, name, val)
+                set_axes.append(name)
+            except Exception:  # noqa: BLE001 - only whatever exists
+                pass
+    # (2) Direct property injection: fixed WORLD +X heading (distinguishable from view-relative axes).
+    pawn.Acceleration.X = _INJECT_MAG
+    pawn.Acceleration.Y = 0.0
+    pawn.Acceleration.Z = 0.0
+
+    if every_n("client_inject", 30):
+        a = Vector(pawn.Acceleration)
+        a.z = 0.0
+        log.info(f"CLIENT_INJECT set_axes={set_axes} pawn_accel=({a.x:.0f},{a.y:.0f})")
 
 
 @hook("Engine.PlayerController:MoveAutonomous")
-def probe_move_autonomous(
+def probe_observe_client_dir(
     obj: unreal.UObject,
     args: unreal.WrappedStruct,
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """DIAGNOSTIC (temporary): can the host dictate a remote proxy's server-side movement direction?
+    """HOST: observe the replicated Acceleration for a ducking, non-sliding remote pawn.
 
-    Runs on: HOST, for a remote client's pawn only - MoveAutonomous re-sims autonomous proxies; the
-    host's own pawn uses PlayerMove. PRE-hook: the Velocity we read is the result of LAST tick's
-    physics under the Acceleration we forced then; we then force a new cross-direction for this tick.
+    Runs on: HOST only. Observe-only - no forcing, no cap lift - so client_dir reflects exactly what
+    the client sent. If injection worked, this shows the injected heading even when the player at the
+    other end is pressing nothing.
     """
     if is_client():
         return
@@ -182,76 +212,22 @@ def probe_move_autonomous(
     if player is None:
         return
     pawn = cast("WillowPlayerPawn", pc.Pawn)
-    if pawn is None:
+    if pawn is None or state_for(pc) is not None or not bool(pc.bDuck):
         return
-    # Never probe an active mod slide - only plain crouch-walking, so the mechanism is isolated.
-    if state_for(pc) is not None:
-        return
-
-    if not bool(pc.bDuck):
-        # Player stood up: undo any cap we lifted and clear stored dirs, so they are not left stuck.
-        if player in _cap_lifted:
-            pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
-            _cap_lifted.discard(player)
-            _last_forced.pop(player, None)
-            _last_client.pop(player, None)
-        return
-
-    # Observed result of last tick's physics (under the accel we forced last tick), read before we
-    # overwrite anything this tick.
-    vel = Vector(pawn.Velocity)
-    vel.z = 0.0
-    speed = vel.magnitude
-
-    # This tick's incoming client input direction, from the replicated move param.
-    try:
-        na = Vector(args.newAccel)
-        client_x, client_y = float(na.x), float(na.y)
-    except Exception:  # noqa: BLE001 - arg name/shape varies across builds
-        client_x, client_y = 0.0, 0.0
-    client_mag = math.hypot(client_x, client_y)
-
-    # Forced heading: perpendicular to the client's input, or a fixed axis when they press nothing.
-    if client_mag > 1.0:
-        fx, fy = -client_y / client_mag, client_x / client_mag
-    else:
-        fx, fy = 1.0, 0.0
-
-    if every_n(f"dirauth_{player}", 30):
-        lf = _last_forced.get(player)
-        lc = _last_client.get(player)
-        # Angle of the OBSERVED velocity (last tick's physics) to what we forced last tick vs. what
-        # the client pressed last tick. Whichever is small is what actually steered the proxy.
-        ang_forced = _angle_deg(vel.x, vel.y, lf[0], lf[1]) if lf else -1.0
-        ang_client = _angle_deg(vel.x, vel.y, lc[0], lc[1]) if lc else -1.0
-        if ang_forced < 0 or ang_client < 0:
-            verdict = "pending"
-        elif ang_forced < ang_client:
-            verdict = "HOST_CONTROLS"
-        else:
-            verdict = "client_controls"
-        if speed > 1e-3:
-            vel_dir = f"({vel.x / speed:.2f},{vel.y / speed:.2f})"
-        else:
-            vel_dir = "(0,0)"
-        log.info(
-            f"DIR_AUTH player={player} speed={speed:.0f} vel_dir={vel_dir}"
-            f" client_dir=({client_x:.0f},{client_y:.0f}) forced_dir=({fx:.2f},{fy:.2f})"
-            f" ang_to_forced={ang_forced:.1f} ang_to_client={ang_client:.1f} verdict={verdict}",
-        )
-
-    # Force the cross-direction and lift the cap for THIS tick's physics.
-    pawn.Acceleration.X = fx * _FORCE_MAG
-    pawn.Acceleration.Y = fy * _FORCE_MAG
-    pawn.Acceleration.Z = 0.0
-    pawn.CrouchedPct = _PROBE_CAP
-    _cap_lifted.add(player)
-    _last_forced[player] = (fx, fy)
-    _last_client[player] = (client_x, client_y)
+    if every_n(f"observe_{player}", 30):
+        try:
+            na = Vector(args.newAccel)
+            na.z = 0.0
+            client_dir = f"({na.x:.0f},{na.y:.0f}) mag={na.magnitude:.0f}"
+        except Exception:  # noqa: BLE001 - arg name/shape varies
+            client_dir = "?"
+        vel = Vector(pawn.Velocity)
+        vel.z = 0.0
+        log.info(f"OBSERVE_DIR player={player} client_dir={client_dir} vel_mag={vel.magnitude:.0f}")
 
 
 # ---------------------------------------------------------------------------------------------------
 
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
-all_hooks = [handle_move, handle_duck, jump, probe_move_autonomous]
+all_hooks = [handle_move, handle_duck, jump, probe_client_inject, probe_observe_client_dir]
