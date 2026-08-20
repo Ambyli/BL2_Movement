@@ -246,9 +246,9 @@ def _drive_slide(
     while True:
         yield WaitWhile(_paused)
 
-        # DIAGNOSTIC (temporary): throttle 1 = one SLIDE_TICK line per frame, so the `moved`/`motion`
-        # fields form a true per-frame trace. Restore to 30 once the coast-vs-snap question is settled.
-        verbose = every_n("_drive_slide", 1)
+        # DIAGNOSTIC: back to 30 (coast-vs-snap is settled). Set to 1 again if you need a per-frame
+        # `moved`/`motion` trace; at 1 the log fills ~100 lines/s and rotates fast.
+        verbose = every_n("_drive_slide", 30)
         pc = pc_ref()
         pawn = None if pc is None else cast("WillowPlayerPawn", pc.Pawn)
         if pc is None or pawn is None:

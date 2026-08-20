@@ -7,6 +7,7 @@ of it, and carry its momentum across.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 from mods_base import hook
@@ -15,7 +16,7 @@ from unrealsdk import unreal
 
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
-from .state import OWN_SLIDE_STATE, State
+from .state import OWN_SLIDE_STATE, State, player_id
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -122,6 +123,68 @@ def handle_duck(
     log.info("handle_duck exit")
 
 
+# DIAGNOSTIC (temporary) --------------------------------------------------------------------------
+# Measure the real inter-arrival interval of ServerMove on the host, per remote player, to settle
+# whether the ~4Hz teleport cadence is the client's move-send rate (NetMoveDelta predicts ~45Hz) or
+# something downstream. ServerMove executes server-side, so these fire on the HOST only, and only
+# for remote clients' pawns (the host's own pawn is authoritative locally and never routes movement
+# through ServerMove). Remove this whole block once the send rate is confirmed.
+_sm_last: dict[int, float] = {}
+_sm_sum: dict[int, float] = {}
+_sm_count: dict[int, int] = {}
+
+
+def _record_servermove(obj: unreal.UObject, variant: str) -> None:
+    """Fold one ServerMove receipt into the per-player interval average, logging every 30th."""
+    pc = cast("WillowPlayerController", obj)
+    player = player_id(pc)
+    if player is None:
+        return
+    now = time.perf_counter()
+    last = _sm_last.get(player)
+    _sm_last[player] = now
+    if last is None:
+        return
+    dt = now - last
+    _sm_sum[player] = _sm_sum.get(player, 0.0) + dt
+    _sm_count[player] = _sm_count.get(player, 0) + 1
+    if every_n(f"servermove_{player}", 30):
+        n = _sm_count[player]
+        avg = _sm_sum[player] / n if n else 0.0
+        hz = 1.0 / avg if avg > 0 else 0.0
+        log.info(
+            f"SERVERMOVE_RATE player={player} last_variant={variant}"
+            f" avg_interval={avg * 1000:.1f}ms rate={hz:.1f}Hz last_dt={dt * 1000:.1f}ms"
+            f" samples={n}",
+        )
+        _sm_sum[player] = 0.0
+        _sm_count[player] = 0
+
+
+@hook("WillowGame.WillowPlayerController:ServerMove")
+def probe_server_move(
+    obj: unreal.UObject,
+    _args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """DIAGNOSTIC (temporary): single-move ServerMove receipt. Runs on: HOST, remote pawns only."""
+    _record_servermove(obj, "single")
+
+
+@hook("WillowGame.WillowPlayerController:ServerMoveDual")
+def probe_server_move_dual(
+    obj: unreal.UObject,
+    _args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """DIAGNOSTIC (temporary): dual (combined) ServerMove receipt. Runs on: HOST, remote pawns only."""
+    _record_servermove(obj, "dual")
+
+
+# ---------------------------------------------------------------------------------------------------
+
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
-all_hooks = [handle_move, handle_duck, jump]
+all_hooks = [handle_move, handle_duck, jump, probe_server_move, probe_server_move_dual]
