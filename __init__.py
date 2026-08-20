@@ -11,6 +11,7 @@ from mods_base import CoopSupport, build_mod
 from networking import add_network_functions
 
 from . import discovery, events, sync, viewmodel
+from . import events, viewmodel
 from .config import all_options
 from .debug import log
 from .hooks import all_hooks
@@ -22,21 +23,14 @@ from .lifecycle import network_functions as lifecycle_network_functions
 events.slide_started.append(viewmodel.on_start)
 events.slide_ended.append(viewmodel.on_end)
 
-# Diagnostics ride the same event rather than hooking anything of their own, which is the point of
-# the event list.
-events.slide_started.append(discovery.on_start)
-events.slide_ended.append(discovery.on_end)
-
 
 def _on_enable() -> None:
     log.info("_on_enable enter")
-    discovery.enable()
     log.info("_on_enable exit")
 
 
 def _on_disable() -> None:
     log.info("_on_disable enter")
-    discovery.disable()
     log.info("_on_disable exit")
 
 
