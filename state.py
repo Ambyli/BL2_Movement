@@ -74,6 +74,12 @@ class PlayerSlideState:
     max_duration: float = 0.0
     steer_rate: float = 0.0
     max_turn_degrees: float = 0.0
+    # The CrouchedPct the pawn should hold this frame - GroundSpeed * cap is the walking-physics speed
+    # limit, so `cap` IS the slide's speed governor now that velocity is no longer forced directly.
+    # The driver recomputes it each tick from the decay curve; the injection hook (own pawn) and the
+    # MoveAutonomous hook (remote pawn on the host) read it and stamp it onto the pawn so the engine's
+    # own movement drives the slide at slide speed on both machines.
+    cap: float = 0.0
     # DIAGNOSTIC (temporary): last frame's horizontal Location, so the driver can log how far the
     # pawn actually moved between frames versus how far our forced velocity should have carried it.
     # `has_prev_loc` guards the first frame, where there is nothing to diff against. Remove these
@@ -263,6 +269,9 @@ def begin_slide_state(
     slide_data.max_duration = settings.max_duration
     slide_data.steer_rate = settings.steer_rate
     slide_data.max_turn_degrees = settings.max_turn_degrees
+    # Open the cap at the curve's top so the very first frame - before the driver recomputes it - is
+    # already clear of a clamp rather than zero (which would freeze the pawn for one frame).
+    slide_data.cap = SLIDE_SPEED_DEFAULT
     # DIAGNOSTIC (temporary): a fresh slide has no previous frame to diff Location against.
     slide_data.prev_loc_x = 0.0
     slide_data.prev_loc_y = 0.0

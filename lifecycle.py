@@ -21,13 +21,12 @@ from typing import TYPE_CHECKING, cast
 from coroutines import Time, WaitWhile, start_coroutine_tick
 from mods_base import get_pc
 from networking.decorators import host
-from uemath import Vector
 from unrealsdk.unreal import WeakPointer
 
 from . import events
 from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT
 from .debug import every_n, log
-from .movement import apply_slide_physics, can_slide, slide
+from .movement import can_slide, compute_cap, slide
 from .state import (
     OWN_SLIDE_STATE,
     PLAYER_SETTINGS,
@@ -232,12 +231,6 @@ def _log_slide_snapshot(
     )
 
 
-# DIAGNOSTIC (temporary): distinctive value stamped onto a remote pawn's CrouchedPct on the host, to
-# test whether the client's CrouchedPct replicates. Far outside the slide's own range (~0.5-2.2) so a
-# reading is unambiguous. See the CROUCH_REPL block in `_drive_slide`.
-_CROUCH_SENTINEL = 9.99
-
-
 def _drive_slide(
     pc_ref: WeakPointer[WillowPlayerController],
     state: PlayerSlideState,
@@ -275,20 +268,6 @@ def _drive_slide(
         # compare what the engine had this frame against what we are about to force onto it.
         pre_speed = math.hypot(pawn.Velocity.X, pawn.Velocity.Y) if verbose else 0.0
 
-        # DIAGNOSTIC (temporary): CrouchedPct replication probe, host side only. We stamped
-        # `_CROUCH_SENTINEL` at the end of last tick (below); read it now, before anything writes it,
-        # to see what the engine did to it over the frame. This is the B* gate:
-        #   ~= the client's decaying slide values (2.2 -> down) -> CrouchedPct replicates client->host
-        #   still == _CROUCH_SENTINEL                           -> free property, nothing syncs it
-        #   ~= 0.5-1.0 (engine crouch default)                  -> engine recomputes it; can't set-and-hold
-        # `state is not OWN_SLIDE_STATE` in a driver only ever means the host driving a remote slide.
-        is_remote_on_host = state is not OWN_SLIDE_STATE
-        if is_remote_on_host and verbose:
-            log.info(
-                f"CROUCH_REPL player={player_id(pc)} observed_crouched_pct={pawn.CrouchedPct:.3f}"
-                f" sentinel={_CROUCH_SENTINEL:.2f} bduck={bool(pc.bDuck)}",
-            )
-
         # Physical gate first, then the decay curve. Either ending the slide ends the driver.
         if not can_slide(pc, pawn, state) or slide(pawn, state, delta_time):
             log.info("_drive_slide teardown reason=gate_or_decay")
@@ -296,28 +275,12 @@ def _drive_slide(
             log.info("_drive_slide exit reason=slide_ended")
             return
 
-        # Refresh the frame's steering input on the machine that owns this slide - only ever our own
-        # here, since the host's copy of a remote slide has its input written by server_slide_input.
-        # On a client, also forward the sample to the host so its copy reads what we are pressing
-        # instead of Unreal's replicated Acceleration.
-        if state is OWN_SLIDE_STATE:
-            accel = Vector(pawn.Acceleration)
-            state.input_x = accel.x
-            state.input_y = accel.y
-            if is_client():
-                try:
-                    server_slide_input(state.input_x, state.input_y)
-                except Exception as ex:  # noqa: BLE001 - a failed send must never break the driver
-                    log.warning(f"INPUT SEND FAILED {type(ex).__name__}: {ex}")
-
-        apply_slide_physics(pawn, state, delta_time)
-
-        # DIAGNOSTIC (temporary): stamp the sentinel over apply_slide_physics's own CrouchedPct write,
-        # so next tick's CROUCH_REPL read shows whether anything (a replicated client value, or engine
-        # crouch physics) overwrote it during the frame. Harmless: the host pawn's position is not
-        # driven by our writes anyway - that's the bug - so lifting the cap here changes nothing seen.
-        if is_remote_on_host:
-            pawn.CrouchedPct = _CROUCH_SENTINEL
+        # Compute only - no pawn writes here. Steering rotates the heading from the owning player's
+        # live input (which the injection hook in `hooks` stashed into state before overwriting the
+        # pawn's axes); the host does not steer a remote slide, whose heading arrives already-steered
+        # in the replicated Acceleration. The speed cap is recomputed each tick and stamped onto the
+        # pawn elsewhere - the injection hook for our own pawn, the MoveAutonomous hook for a remote.
+        state.cap = compute_cap(state, pawn.GroundSpeed)
 
         if verbose:
             _log_slide_snapshot(pc, pawn, state, pre_speed, delta_time)
@@ -562,32 +525,6 @@ def server_enter_slide(dir_x: float, dir_y: float) -> None:
     log.info(f"server_enter_slide exit started={started}")
 
 
-@host.json_message
-def server_slide_input(input_x: float, input_y: float) -> None:
-    """Write the sender's live steering input into the host's copy of their slide.
-
-    Runs on: HOST only. Fires once per client-side driver tick during a slide, so the host's copy
-    reads the same steering vector the client's `apply_slide_physics` did on the same frame rather
-    than whatever Unreal's Acceleration replication last produced. No-op if the host has not yet
-    started (or has already ended) its copy of that player's slide - order between this and the
-    enter/exit messages is not something the driver relies on.
-    """
-    verbose = every_n("server_slide_input", 30)
-    if verbose:
-        log.debug(f"server_slide_input enter input=({input_x:.2f},{input_y:.2f})")
-    pc = cast("WillowPlayerController", server_slide_input.sender.Owner)
-    if pc is None or (state := state_for(pc)) is None:
-        if verbose:
-            log.debug(
-                f"server_slide_input exit reason=no_state has_pc={pc is not None}",
-            )
-        return
-    state.input_x = input_x
-    state.input_y = input_y
-    if verbose:
-        log.debug(f"server_slide_input exit stored player={player_id(pc)}")
-
-
 @host.message
 def server_exit_slide() -> None:
     """Stop the host's copy of a player's slide. Runs on: HOST only."""
@@ -638,7 +575,6 @@ network_functions = [
     server_announce_settings,
     server_enter_slide,
     server_exit_slide,
-    server_slide_input,
     server_set_slide_jump_velocity,
 ]
 

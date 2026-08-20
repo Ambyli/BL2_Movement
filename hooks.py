@@ -7,14 +7,18 @@ of it, and carry its momentum across.
 
 from __future__ import annotations
 
+import math
+
 from typing import TYPE_CHECKING, Any, cast
 
 from mods_base import hook
+from coroutines import Time
 from uemath import Vector
 from unrealsdk import unreal
 
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
+from .movement import steer_heading
 from .state import OWN_SLIDE_STATE, State, is_client, player_id, state_for
 
 if TYPE_CHECKING:
@@ -122,112 +126,120 @@ def handle_duck(
     log.info("handle_duck exit")
 
 
-# DIAGNOSTIC (temporary) --------------------------------------------------------------------------
-# Client-side injection test. Option (a) is dead - the host cannot steer a remote proxy; its
-# direction (and whether it moves at all) comes solely from the client's replicated Acceleration. So
-# B* needs the CLIENT to make its OUTGOING move carry the slide heading. This tests whether we can
-# inject that. On the client, during crouch-walk (no mod slide), we override the outgoing heading to
-# a fixed "full forward" via (1) the input axes and (2) Pawn.Acceleration directly; on the host we
-# OBSERVE the replicated client_dir. Decisive run: crouch-walk while pressing NOTHING -
-#   host sees client_dir != 0 (motion the player never pressed) -> injection reaches the wire; B* works
-#   host sees client_dir == 0                                    -> this injection point does not stick
-# We also log which input-axis fields actually exist (names vary across builds) to wire the real
-# slide injection next. The client will lurch forward against your input during the test - expected.
-_INJECT_MAG: float = 2048.0
-_AXIS_CANDIDATES: tuple[str, ...] = ("aForward", "aStrafe", "aBaseX", "aBaseY", "aUp", "aTurn", "aLookUp")
-_axes_discovered: bool = False
+# B* injection ------------------------------------------------------------------------------------
+# The slide is driven by the engine's own walking physics, not by forced velocity, because that is
+# the only motion a listen-server host reproduces for a remote client's pawn. Two pieces feed it:
+# this client/own-pawn hook forces the outgoing move to carry the slide heading (as input axes) plus
+# the speed cap (as CrouchedPct); the host's MoveAutonomous hook below holds the same cap on each
+# remote proxy so the server re-sim drives it at slide speed along the replicated heading.
+
+
+def _view_basis(pc: WillowPlayerController) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Ground forward/right unit vectors for the controller's view yaw.
+
+    UE yaw is 0 = +X, 16384 = +Y, so forward = (cos, sin) and right is 90 degrees clockwise from it,
+    (sin, -cos). These convert between the pawn's view-relative input axes and world headings. If a
+    built slide comes out mirrored, the sign of `right` is the one knob to flip.
+    """
+    theta = float(pc.Rotation.Yaw) * (math.tau / 65536.0)
+    c, s = math.cos(theta), math.sin(theta)
+    return (c, s), (s, -c)
 
 
 @hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove")
-def probe_client_inject(
+def inject_slide_heading(
     obj: unreal.UObject,
     _args: unreal.WrappedStruct,
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """CLIENT: force the outgoing move heading during crouch-walk, to test if it replicates.
+    """Own pawn: steer from raw input, then overwrite the outgoing move with the slide heading + cap.
 
-    Runs on: CLIENT only, for the local player, while ducking and not in a mod slide. PRE-hook, so
-    axis writes land before PlayerMove reads them to compute this frame's Acceleration.
+    Runs on: the machine whose local player is sliding (client, or a listen-server host who is also a
+    player). PRE-hook so the axis writes land before PlayerMove reads them to build - and replicate -
+    this frame's Acceleration.
     """
-    if not is_client():
+    state = OWN_SLIDE_STATE
+    if not state.is_sliding:
         return
     pc = cast("WillowPlayerController", obj)
-    if not bool(pc.bDuck) or OWN_SLIDE_STATE.is_sliding:
-        return
     pawn = cast("WillowPlayerPawn", pc.Pawn)
     if pawn is None:
         return
     pin = getattr(pc, "PlayerInput", None)
+    fwd, right = _view_basis(pc)
 
-    global _axes_discovered  # noqa: PLW0603 - one-shot discovery latch
-    if not _axes_discovered and pin is not None:
-        _axes_discovered = True
-        found: list[str] = []
-        for name in _AXIS_CANDIDATES:
-            try:
-                found.append(f"{name}={float(getattr(pin, name)):.2f}")
-            except Exception:  # noqa: BLE001 - probing which axis fields exist
-                pass
-        log.info(f"INJECT_DISCOVER axes=[{', '.join(found)}]")
+    # The pawn's Acceleration right now is last frame's - the result of the axes we forced then.
+    # Logged below against the heading we intended, so a wrong view-basis sign shows up immediately.
+    prev = Vector(pawn.Acceleration)
+    prev.z = 0.0
 
-    # (1) Input-axis injection: force full forward / no strafe, overriding real input. Names vary, so
-    # set whichever exist.
-    set_axes: list[str] = []
+    # 1) Read the player's RAW steering input (before we overwrite the axes) and project it to world.
+    raw_f = raw_s = 0.0
     if pin is not None:
-        for name, val in (("aForward", 1.0), ("aBaseY", 1.0), ("aStrafe", 0.0), ("aBaseX", 0.0)):
+        try:
+            raw_f = float(pin.aForward)
+            raw_s = float(pin.aStrafe)
+        except Exception:  # noqa: BLE001 - axis fields absent on some builds; no steering then
+            raw_f = raw_s = 0.0
+    state.input_x = raw_f * fwd[0] + raw_s * right[0]
+    state.input_y = raw_f * fwd[1] + raw_s * right[1]
+
+    # 2) Steer the heading from that input, this frame (zero lag).
+    steer_heading(state, Time.delta_time)
+
+    # 3) Overwrite the outgoing move to carry the slide heading: decompose the world heading back
+    # into view-relative axes. |(af, as_)| == 1 for a unit heading, which is full input, so walking
+    # physics accelerates to the full GroundSpeed * cap along the heading.
+    af = state.dir_x * fwd[0] + state.dir_y * fwd[1]
+    as_ = state.dir_x * right[0] + state.dir_y * right[1]
+    if pin is not None:
+        for name, val in (("aForward", af), ("aBaseY", af), ("aStrafe", as_), ("aBaseX", as_)):
             try:
                 setattr(pin, name, val)
-                set_axes.append(name)
-            except Exception:  # noqa: BLE001 - only whatever exists
+            except Exception:  # noqa: BLE001 - set whichever axis fields this build exposes
                 pass
-    # (2) Direct property injection: fixed WORLD +X heading (distinguishable from view-relative axes).
-    pawn.Acceleration.X = _INJECT_MAG
-    pawn.Acceleration.Y = 0.0
-    pawn.Acceleration.Z = 0.0
 
-    if every_n("client_inject", 30):
-        a = Vector(pawn.Acceleration)
-        a.z = 0.0
-        log.info(f"CLIENT_INJECT set_axes={set_axes} pawn_accel=({a.x:.0f},{a.y:.0f})")
+    # 4) Hold the speed cap so the pawn's own walking physics runs at slide speed - both for local
+    # feel and so this machine's ServerMove reports a slide-speed move for the host to reproduce.
+    pawn.CrouchedPct = state.cap
+
+    if every_n("inject", 30):
+        pmag = prev.magnitude
+        prev_dir = f"({prev.x / pmag:.2f},{prev.y / pmag:.2f})" if pmag > 1.0 else "(0,0)"
+        log.info(
+            f"INJECT dir=({state.dir_x:.2f},{state.dir_y:.2f}) prev_accel_dir={prev_dir}"
+            f" af={af:.2f} as={as_:.2f} cap={state.cap:.2f} input=({state.input_x:.2f},{state.input_y:.2f})",
+        )
 
 
 @hook("Engine.PlayerController:MoveAutonomous")
-def probe_observe_client_dir(
+def apply_remote_cap(
     obj: unreal.UObject,
-    args: unreal.WrappedStruct,
+    _args: unreal.WrappedStruct,
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """HOST: observe the replicated Acceleration for a ducking, non-sliding remote pawn.
+    """Host: hold a remote sliding proxy's speed cap so the server re-sim drives it at slide speed.
 
-    Runs on: HOST only. Observe-only - no forcing, no cap lift - so client_dir reflects exactly what
-    the client sent. If injection worked, this shows the injected heading even when the player at the
-    other end is pressing nothing.
+    Runs on: HOST only, for a remote client's pawn (MoveAutonomous re-sims autonomous proxies). The
+    heading needs no help here - it arrives in the replicated Acceleration the client forced. We only
+    lift the cap, recomputed each driver tick into `state.cap`, so the re-sim is not clamped to crouch
+    speed. PRE-hook so the cap is in place before this move's walking physics runs.
     """
     if is_client():
         return
     pc = cast("WillowPlayerController", obj)
-    player = player_id(pc)
-    if player is None:
+    if (state := state_for(pc)) is None:
         return
     pawn = cast("WillowPlayerPawn", pc.Pawn)
-    if pawn is None or state_for(pc) is not None or not bool(pc.bDuck):
+    if pawn is None:
         return
-    if every_n(f"observe_{player}", 30):
-        try:
-            na = Vector(args.newAccel)
-            na.z = 0.0
-            client_dir = f"({na.x:.0f},{na.y:.0f}) mag={na.magnitude:.0f}"
-        except Exception:  # noqa: BLE001 - arg name/shape varies
-            client_dir = "?"
-        vel = Vector(pawn.Velocity)
-        vel.z = 0.0
-        log.info(f"OBSERVE_DIR player={player} client_dir={client_dir} vel_mag={vel.magnitude:.0f}")
+    pawn.CrouchedPct = state.cap
+    if every_n(f"remotecap_{player_id(pc)}", 30):
+        log.info(f"REMOTE_CAP player={player_id(pc)} cap={state.cap:.2f} crouched_pct={pawn.CrouchedPct:.3f}")
 
-
-# ---------------------------------------------------------------------------------------------------
 
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
-all_hooks = [handle_move, handle_duck, jump, probe_client_inject, probe_observe_client_dir]
+all_hooks = [handle_move, handle_duck, jump, inject_slide_heading, apply_remote_cap]
