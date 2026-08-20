@@ -13,9 +13,10 @@ from mods_base import hook
 from uemath import Vector
 from unrealsdk import unreal
 
+from .config import CROUCHED_PCT_DEFAULT
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
-from .state import OWN_SLIDE_STATE, State
+from .state import OWN_SLIDE_STATE, State, is_client, player_id, state_for
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -122,6 +123,78 @@ def handle_duck(
     log.info("handle_duck exit")
 
 
+# DIAGNOSTIC (temporary) --------------------------------------------------------------------------
+# B* speed-cap probe. The CrouchedPct-replication probe showed our host-side write on a remote pawn
+# persists untouched - but that only proves the WRITE sticks, not that the server's walking sim READS
+# it as the speed cap. This tests exactly that: on the host, inside MoveAutonomous (which re-sims a
+# remote client's move server-side), lift CrouchedPct well above normal crouch and watch whether the
+# resulting server-side horizontal speed climbs toward GroundSpeed * lifted_cap. Run it by having the
+# remote client crouch-WALK at full forward input, with NO mod slide active:
+#   ratio (speed/GroundSpeed) climbs toward _PROBE_CAP  -> cap is live; B* can open it in MoveAutonomous
+#   ratio stays at normal crouch (~0.5)                  -> cap computed elsewhere; need another lever
+# Only fires for a ducking, non-sliding remote pawn on the host, so it never touches an active slide.
+# Lifting the cap makes that player briefly rubber-band on their own screen - expected, it is the test.
+_PROBE_CAP: float = 3.0
+_cap_lifted: set[int] = set()
+
+
+@hook("Engine.PlayerController:MoveAutonomous")
+def probe_move_autonomous(
+    obj: unreal.UObject,
+    args: unreal.WrappedStruct,
+    _ret: Any,
+    _func: unreal.BoundFunction,
+) -> None:
+    """DIAGNOSTIC (temporary): does the server's MoveAutonomous honor CrouchedPct as the speed cap?
+
+    Runs on: HOST, for a remote client's pawn only - MoveAutonomous re-sims autonomous proxies; the
+    host's own pawn uses PlayerMove. This is a PRE-hook, firing before this tick's walking physics, so
+    the Velocity read here is the result of LAST tick's physics under the cap we lifted then.
+    """
+    if is_client():
+        return
+    pc = cast("WillowPlayerController", obj)
+    player = player_id(pc)
+    if player is None:
+        return
+    pawn = cast("WillowPlayerPawn", pc.Pawn)
+    if pawn is None:
+        return
+    # Never probe an active mod slide - only plain crouch-walking, so the cap mechanism is isolated.
+    if state_for(pc) is not None:
+        return
+
+    if not bool(pc.bDuck):
+        # Player stood up: undo any cap we lifted, so they are not left stuck fast.
+        if player in _cap_lifted:
+            pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
+            _cap_lifted.discard(player)
+        return
+
+    if every_n(f"moveauto_{player}", 30):
+        vel = Vector(pawn.Velocity)
+        vel.z = 0.0
+        speed = vel.magnitude
+        ground = max(float(pawn.GroundSpeed), 1.0)
+        try:
+            accel = Vector(args.newAccel)
+            accel.z = 0.0
+            accel_mag = accel.magnitude
+        except Exception:  # noqa: BLE001 - arg name/shape varies; input magnitude is a nice-to-have
+            accel_mag = -1.0
+        log.info(
+            f"MOVEAUTO_CAP player={player} speed={speed:.0f} ground={ground:.0f}"
+            f" ratio={speed / ground:.3f} crouched_pct={pawn.CrouchedPct:.3f}"
+            f" probe_cap={_PROBE_CAP:.2f} accel_mag={accel_mag:.0f}",
+        )
+
+    # Lift the cap for THIS tick's physics (which runs after this pre-hook returns).
+    pawn.CrouchedPct = _PROBE_CAP
+    _cap_lifted.add(player)
+
+
+# ---------------------------------------------------------------------------------------------------
+
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
-all_hooks = [handle_move, handle_duck, jump]
+all_hooks = [handle_move, handle_duck, jump, probe_move_autonomous]
