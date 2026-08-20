@@ -21,13 +21,12 @@ from typing import TYPE_CHECKING, cast
 from coroutines import Time, WaitWhile, start_coroutine_tick
 from mods_base import get_pc
 from networking.decorators import host
-from uemath import Vector
 from unrealsdk.unreal import WeakPointer
 
 from . import events
-from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT
+from .constants import CROUCHED_PCT_DEFAULT, POST_LOG_EVERY, SLIDE_SPEED_DEFAULT
 from .debug import every_n, log
-from .movement import apply_slide_physics, can_slide, slide
+from .movement import can_slide, compute_cap, slide
 from .state import (
     OWN_SLIDE_STATE,
     PLAYER_SETTINGS,
@@ -53,7 +52,7 @@ def _paused() -> bool:
     A read that fails mid-transition counts as not paused, so the driver falls through to its own
     teardown check on the next tick rather than stalling forever on a controller that is gone.
     """
-    verbose = every_n("_paused", 30)
+    verbose = every_n("_paused", POST_LOG_EVERY)
     if verbose:
         log.debug("_paused enter")
     try:
@@ -135,7 +134,6 @@ def _log_slide_snapshot(
     pc: WillowPlayerController,
     pawn: WillowPlayerPawn,
     state: PlayerSlideState,
-    pre_speed: float,
     delta_time: float,
 ) -> None:
     """Emit one consolidated `SLIDE_TICK` line summarising a slide in progress.
@@ -153,11 +151,11 @@ def _log_slide_snapshot(
       is looking as they slide.
     - **turn_deg** - unsigned angle from entry heading to current heading; how much the slide has
       already curved (compare against `max_turn_degrees`).
-    - **input** - the raw steering vector driving that turn (sampled locally or arrived via
-      `server_slide_input`).
-    - **speed_forced / speed_actual** - what `apply_slide_physics` just wrote vs. what the engine
-      had entering the tick. A persistent gap between them is the signature of something else
-      (correction, walking physics, another mod) fighting our writes.
+    - **input** - the world-space steering input the owning player is feeding the slide this frame
+      (zero on the host's copy of a remote slide, which does not steer).
+    - **speed_forced / speed_actual** - the slide speed the decay curve calls for vs. the pawn's
+      actual horizontal speed. They should track closely; a persistent gap means walking physics is
+      not reaching the cap (aiming down sights, a slope, another mod).
     - **pct** - decay curve position, the same value `slide()` logs.
     - **elapsed / max, progress** - how close to the hard duration cap this slide is.
     - **ground, crouched_pct** - the two engine flags most likely to end a slide unexpectedly.
@@ -184,14 +182,16 @@ def _log_slide_snapshot(
     else:
         turn_deg = 0.0
     forced_speed = state.start_speed * (state.speed_pct / SLIDE_SPEED_DEFAULT)
+    speed_actual = math.hypot(pawn.Velocity.X, pawn.Velocity.Y)
     progress = state.elapsed / state.max_duration if state.max_duration > 0 else 0.0
+
     log.debug(
         f"SLIDE_TICK who={player_id(pc)}"
         f" pos=({pawn.Location.X:.0f},{pawn.Location.Y:.0f},{pawn.Location.Z:.0f})"
         f" facing_deg={yaw_deg:.1f} dir=({state.dir_x:.3f},{state.dir_y:.3f})"
         f" side_deg={side_deg:.1f} turn_deg={turn_deg:.1f}"
         f" input=({state.input_x:.2f},{state.input_y:.2f})"
-        f" speed_forced={forced_speed:.0f} speed_actual={pre_speed:.0f}"
+        f" speed_forced={forced_speed:.0f} speed_actual={speed_actual:.0f}"
         f" pct={state.speed_pct:.3f}"
         f" elapsed={state.elapsed:.2f}/{state.max_duration:.2f} progress={progress * 100:.0f}%"
         f" ground={pawn.IsOnGroundOrShortFall()} crouched_pct={pawn.CrouchedPct:.3f}"
@@ -213,7 +213,9 @@ def _drive_slide(
     while True:
         yield WaitWhile(_paused)
 
-        verbose = every_n("_drive_slide", 30)
+        # One consolidated SLIDE_TICK line per this many frames - a slide costs a few lines, not
+        # hundreds. Drop to 1 for a per-frame trace when debugging.
+        verbose = every_n("_drive_slide", POST_LOG_EVERY)
         pc = pc_ref()
         pawn = None if pc is None else cast("WillowPlayerPawn", pc.Pawn)
         if pc is None or pawn is None:
@@ -230,10 +232,6 @@ def _drive_slide(
                 log.debug(f"_drive_slide skip reason=delta<=0 delta={delta_time:.4f}")
             continue
 
-        # Read the pawn's velocity BEFORE physics writes to it, so `_log_slide_snapshot` below can
-        # compare what the engine had this frame against what we are about to force onto it.
-        pre_speed = math.hypot(pawn.Velocity.X, pawn.Velocity.Y) if verbose else 0.0
-
         # Physical gate first, then the decay curve. Either ending the slide ends the driver.
         if not can_slide(pc, pawn, state) or slide(pawn, state, delta_time):
             log.info("_drive_slide teardown reason=gate_or_decay")
@@ -241,24 +239,15 @@ def _drive_slide(
             log.info("_drive_slide exit reason=slide_ended")
             return
 
-        # Refresh the frame's steering input on the machine that owns this slide - only ever our own
-        # here, since the host's copy of a remote slide has its input written by server_slide_input.
-        # On a client, also forward the sample to the host so its copy reads what we are pressing
-        # instead of Unreal's replicated Acceleration.
-        if state is OWN_SLIDE_STATE:
-            accel = Vector(pawn.Acceleration)
-            state.input_x = accel.x
-            state.input_y = accel.y
-            if is_client():
-                try:
-                    server_slide_input(state.input_x, state.input_y)
-                except Exception as ex:  # noqa: BLE001 - a failed send must never break the driver
-                    log.warning(f"INPUT SEND FAILED {type(ex).__name__}: {ex}")
-
-        apply_slide_physics(pawn, state, delta_time)
+        # Compute only - no pawn writes here. Steering rotates the heading from the owning player's
+        # live input (which the injection hook in `hooks` stashed into state before overwriting the
+        # pawn's axes); the host does not steer a remote slide, whose heading arrives already-steered
+        # in the replicated Acceleration. The speed cap is recomputed each tick and stamped onto the
+        # pawn elsewhere - the injection hook for our own pawn, the MoveAutonomous hook for a remote.
+        state.cap = compute_cap(state, pawn.GroundSpeed)
 
         if verbose:
-            _log_slide_snapshot(pc, pawn, state, pre_speed, delta_time)
+            _log_slide_snapshot(pc, pawn, state, delta_time)
 
 
 def begin_slide(
@@ -281,6 +270,7 @@ def begin_slide(
         f"begin_slide enter dir=({dir_x:.3f},{dir_y:.3f}) start_speed={settings.start_speed:.0f}"
         f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
         f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}"
+        f" downhill={settings.downhill_boost:.4f} uphill={settings.uphill_drag:.4f}"
         f" have_state={state is not None} live_slides={len(SLIDE_STATES)}",
     )
     if (player := player_id(pc)) is None or (pawn := cast("WillowPlayerPawn", pc.Pawn)) is None:
@@ -361,7 +351,8 @@ def _announce_settings_to_host(settings: PlayerSlideSettings) -> None:
     log.info(
         f"_announce_settings_to_host enter start_speed={settings.start_speed:.0f}"
         f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
-        f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}",
+        f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}"
+        f" downhill={settings.downhill_boost:.4f} uphill={settings.uphill_drag:.4f}",
     )
     server_announce_settings(
         settings.start_speed,
@@ -369,6 +360,8 @@ def _announce_settings_to_host(settings: PlayerSlideSettings) -> None:
         settings.max_duration,
         settings.steer_rate,
         settings.max_turn_degrees,
+        settings.downhill_boost,
+        settings.uphill_drag,
     )
     log.info("_announce_settings_to_host exit")
 
@@ -380,8 +373,10 @@ def server_announce_settings(
     max_duration_v: float,
     steer_rate_v: float,
     max_turn_degrees_v: float,
+    downhill_boost_v: float,
+    uphill_drag_v: float,
 ) -> None:
-    """Cache the sender's five slider values on the host, keyed by their PlayerID.
+    """Cache the sender's slider values on the host, keyed by their PlayerID.
 
     Runs on: HOST only. Fired by every client whenever its own sliders change, and once by every
     client at the top of `enter_slide` so the host has fresh values before the enter RPC arrives.
@@ -394,7 +389,8 @@ def server_announce_settings(
     log.info(
         f"server_announce_settings enter start_speed={start_speed_v:.0f}"
         f" decay={decay_rate_v:.3f} max_duration={max_duration_v:.2f}"
-        f" steer={steer_rate_v:.2f} max_turn={max_turn_degrees_v:.1f}",
+        f" steer={steer_rate_v:.2f} max_turn={max_turn_degrees_v:.1f}"
+        f" downhill={downhill_boost_v:.4f} uphill={uphill_drag_v:.4f}",
     )
     pc = cast("WillowPlayerController", server_announce_settings.sender.Owner)
     if pc is None or (player := player_id(pc)) is None:
@@ -406,6 +402,8 @@ def server_announce_settings(
         max_duration=max_duration_v,
         steer_rate=steer_rate_v,
         max_turn_degrees=max_turn_degrees_v,
+        downhill_boost=downhill_boost_v,
+        uphill_drag=uphill_drag_v,
     )
     log.info(
         f"server_announce_settings exit stored player={player} known_players={len(PLAYER_SETTINGS)}",
@@ -446,32 +444,6 @@ def server_enter_slide(dir_x: float, dir_y: float) -> None:
             f" dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}",
         )
     log.info(f"server_enter_slide exit started={started}")
-
-
-@host.json_message
-def server_slide_input(input_x: float, input_y: float) -> None:
-    """Write the sender's live steering input into the host's copy of their slide.
-
-    Runs on: HOST only. Fires once per client-side driver tick during a slide, so the host's copy
-    reads the same steering vector the client's `apply_slide_physics` did on the same frame rather
-    than whatever Unreal's Acceleration replication last produced. No-op if the host has not yet
-    started (or has already ended) its copy of that player's slide - order between this and the
-    enter/exit messages is not something the driver relies on.
-    """
-    verbose = every_n("server_slide_input", 30)
-    if verbose:
-        log.debug(f"server_slide_input enter input=({input_x:.2f},{input_y:.2f})")
-    pc = cast("WillowPlayerController", server_slide_input.sender.Owner)
-    if pc is None or (state := state_for(pc)) is None:
-        if verbose:
-            log.debug(
-                f"server_slide_input exit reason=no_state has_pc={pc is not None}",
-            )
-        return
-    state.input_x = input_x
-    state.input_y = input_y
-    if verbose:
-        log.debug(f"server_slide_input exit stored player={player_id(pc)}")
 
 
 @host.message
@@ -524,7 +496,6 @@ network_functions = [
     server_announce_settings,
     server_enter_slide,
     server_exit_slide,
-    server_slide_input,
     server_set_slide_jump_velocity,
 ]
 

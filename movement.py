@@ -1,4 +1,13 @@
-"""The slide itself: how it decays, how it steers, and how it is forced onto the pawn."""
+"""The slide itself: how it decays, how it steers, and how its speed cap is derived.
+
+Note: The slide is driven by the engine's own walking physics - `GroundSpeed * CrouchedPct` is the
+speed limit and the pawn's Acceleration is the heading - because that is the only motion a listen-server
+host reproduces for a remote client's pawn (it re-simulates each move from the replicated Acceleration,
+and ignores any Velocity we write on the proxy). So the per-frame job here is pure computation:
+advance the decay curve (`slide`), rotate the heading from steering input (`steer_heading`),
+and turn the curve into a CrouchedPct cap (`compute_cap`). The pawn writes live in `hooks` (own pawn)
+and the host's MoveAutonomous hook.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +16,9 @@ from typing import TYPE_CHECKING
 
 from uemath import Vector
 
-from .config import (
+from .constants import (
     CROUCHED_PCT_DEFAULT,
+    POST_LOG_EVERY,
     SLIDE_BACK_CUTOFF,
     SLIDE_SPEED_DEFAULT,
     SLIDE_STEER_DEADZONE,
@@ -20,29 +30,6 @@ if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
 
 
-POST_LOG_EVERY: int = 30
-"""One line per this many forced frames, so a slide costs a handful of lines rather than hundreds."""
-
-
-def _who(pawn: WillowPlayerPawn) -> str:
-    """Name the pawn a forced frame belongs to, as `Name#PlayerID`.
-
-    The host drives every player's slide through here, so an untagged line cannot be attributed and
-    two decay curves interleave into one that appears to jump backwards. The id is on the end
-    because display names are not unique - two machines signed in to the same account report the
-    same name, which is exactly the session this most needs to be readable in.
-    """
-    log.debug(f"_who enter pawn={pawn}")
-    try:
-        pri = pawn.Controller.PlayerReplicationInfo
-        result = f"{pri.PlayerName}#{pri.PlayerID}"
-    except Exception as ex:  # noqa: BLE001 - a label is not worth raising over
-        log.debug(f"_who exit result=? reason={type(ex).__name__}")
-        return "?"
-    log.debug(f"_who exit result={result}")
-    return result
-
-
 def can_slide(
     pc: WillowPlayerController,
     pawn: WillowPlayerPawn,
@@ -50,9 +37,8 @@ def can_slide(
 ) -> bool:
     """Whether this slide should still be running.
 
-    Runs on: BOTH, against whichever player's state it is handed - our own on the machine that owns
-    it, and every sliding player on the host. `bDuck` reaches the host for a remote player through
-    the move stream's compressed flags, so the same gate reads true on both machines.
+    Runs on: BOTH. `bDuck` reaches the host for a remote player through the move stream's compressed
+    flags, so the same gate reads true on both machines.
     """
     verbose = every_n("can_slide", POST_LOG_EVERY)
     if verbose:
@@ -73,12 +59,10 @@ def slide(
 ) -> bool:
     """Advance the decay curve and report whether the slide is spent. Called every frame.
 
-    Owns nothing else: heading and velocity are applied in `apply_slide_physics`, and ending the
-    slide is the caller's job.
+    Owns nothing else: heading is rotated in `steer_heading`, the speed cap is derived in
+    `compute_cap`, and ending the slide is the caller's job.
 
     Runs on: BOTH, from the slide driver in `lifecycle`.
-
-    Returns True when the slide is spent and the caller should end it.
     """
     verbose = every_n("slide", POST_LOG_EVERY)
     if verbose:
@@ -90,15 +74,14 @@ def slide(
     # Height difference against last frame, in unreal units.
     z_diff: float = pawn.Location.Z - slide_data.old_z
 
-    # Time decay applies on every frame; a slope only offsets it, and has to be genuinely steep to
-    # offset it fully. Read the decay rate off the state (captured at slide open from the owning
-    # player's settings) rather than live from config, so the host runs the client's curve.
+    # Time decay applies every frame; a slope only offsets it. Read the decay rate off the state
+    # (captured at slide open from the owning player's settings) so the host runs the client's curve.
     speed = slide_data.speed_pct - delta_time * slide_data.decay_rate
     if z_diff < 0:
-        speed -= z_diff * 0.0005  # downhill, wins some speed back
+        speed -= z_diff * slide_data.downhill_boost  # downhill, wins some speed back
         slope = "downhill"
     else:
-        speed -= z_diff * 0.004  # uphill, sheds extra
+        speed -= z_diff * slide_data.uphill_drag  # uphill, sheds extra
         slope = "uphill"
     if verbose:
         log.debug(
@@ -109,16 +92,15 @@ def slide(
     # A slope may sustain a slide, but never push it past the speed it opened at.
     speed = min(speed, SLIDE_SPEED_DEFAULT)
 
-    # Persist the frame's result. `old_z` is the next frame's slope baseline, `speed_pct` feeds
-    # apply_slide_physics, and `elapsed` is checked against the hard duration cap below.
     slide_data.old_z = pawn.Location.Z
     slide_data.speed_pct = speed
     slide_data.elapsed += delta_time
 
     # Exit verdict: the decay bled below the walking-crouch floor, or the duration cap hit. Both
-    # cutoffs come from state so a remote player's slide ends when their settings say it should,
-    # not when the host's settings would.
-    spent = speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= slide_data.max_duration
+    # cutoffs come from state so a remote player's slide ends when their settings say it should.
+    spent = (
+        speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= slide_data.max_duration
+    )
     if verbose:
         log.debug(
             f"slide exit speed_pct={speed:.3f} elapsed={slide_data.elapsed:.2f}"
@@ -128,114 +110,98 @@ def slide(
     return spent
 
 
-def apply_slide_physics(
-    pawn: WillowPlayerPawn,
-    slide_data: PlayerSlideState,
-    delta_time: float,
-) -> None:
-    """Force the slide's heading and speed onto the pawn.
+def steer_heading(slide_data: PlayerSlideState, delta_time: float) -> None:
+    """Rotate the slide heading from this frame's steering input, clamped to the turn cone.
 
-    The pawn's speed cap is held clear of the forced speed, or the cap clamps the slide back down
-    the moment anything lowers GroundSpeed - aiming down sights being the obvious one.
+    Reads `slide_data.input_x/y` (a world-space input vector - on the owning machine the injection
+    hook writes the player's live input there before overwriting the pawn's axes) and writes the
+    result to `slide_data.dir_x/y`. No pawn writes: the heading reaches our own pawn later as
+    input-axis injection, and reaches a remote pawn on the host through Unreal's replication of the
+    owner's forced Acceleration.
 
-    Steering input is read from `slide_data.input_x/y` rather than `pawn.Acceleration`. The driver
-    on the machine that owns the slide samples the pawn's Acceleration into the state each frame,
-    and streams that value to the host so its copy of a remote slide sees the same input. Reading
-    the pawn directly here would let Unreal's Acceleration replication (which lags a move-window
-    and can read zero across it) pull the two simulations apart.
-
-    Runs on: BOTH, from the slide driver in `lifecycle`.
+    Runs on: the machine that OWNS the slide (the host does not steer a remote slide - that heading
+    arrives already-steered in the replicated Acceleration).
     """
-    verbose = every_n("apply_slide_physics", POST_LOG_EVERY)
-    if verbose:
-        log.debug(
-            f"apply_slide_physics enter who={_who(pawn)}"
-            f" dir=({slide_data.dir_x:.3f},{slide_data.dir_y:.3f})"
-            f" input=({slide_data.input_x:.2f},{slide_data.input_y:.2f})"
-            f" speed_pct={slide_data.speed_pct:.3f} delta={delta_time:.4f}",
-        )
-    # Current slide heading, projected to the ground plane. Zero means the entry heading was never
-    # locked (opened from a standstill) and there is nothing to force onto the pawn.
+    verbose = every_n("steer_heading", POST_LOG_EVERY)
+    # Current slide heading, read straight off state.
     direction = Vector((slide_data.dir_x, slide_data.dir_y, 0.0))
+    # Nothing to steer if we somehow don't have a heading yet.
     if direction.magnitude == 0:
-        if verbose:
-            log.debug("apply_slide_physics exit reason=no_heading")
         return
 
-    # Steering input for this frame. Zero-magnitude input (no movement keys held) skips the steering
-    # branch entirely and the slide runs in a straight line at its current heading.
+    # This frame's steering input as a world-space vector - the injection hook wrote it here.
     accel = Vector((slide_data.input_x, slide_data.input_y, 0.0))
     if accel.magnitude > 0:
+        # Direction of intent only; strength comes back through the vector's length below.
         accel.normalize()
+        # Dot against the heading tells us how much of the input points backwards along the slide.
         backwards = accel.dot(direction)
-        if verbose:
-            log.debug(f"apply_slide_physics calc backwards={backwards:.3f} cutoff={SLIDE_BACK_CUTOFF:.3f}")
+        # Reject input that's more backwards than the cutoff allows - can't u-turn a slide.
         if backwards > SLIDE_BACK_CUTOFF:
-            # Drop the part of the input running back down the slide, then steer on whatever
-            # sideways component survives - weighted by how sideways it actually is. Normalising it
-            # unweighted turns a hair of residue from a near-backwards input into a full strength
-            # turn, which is how holding back spins a slide right around.
+            # Partially-backwards input: strip its heading-parallel component so only sideways pull remains.
             if backwards < 0:
                 accel = accel - direction * backwards
+            # The leftover sideways magnitude scales how hard we turn this frame.
             strength = accel.magnitude
+            # Anything under the deadzone is noise from a resting stick.
             if strength > SLIDE_STEER_DEADZONE:
-                # Steer rate and turn cone come from state (snapshotted at slide open from the
-                # owning player's settings), not live config, so the host steers the client's
-                # slide at the client's rate.
+                # Turn factor this frame: rate x dt x how-hard-you're-pushing, capped at a full rotate.
                 alpha = min(slide_data.steer_rate * delta_time * strength, 1.0)
+                # Ease from current heading toward the input direction by that factor.
                 direction = direction.lerp(accel.normalize(), alpha).normalize()
                 if verbose:
                     log.debug(
-                        f"apply_slide_physics steer strength={strength:.3f} alpha={alpha:.3f}"
+                        f"steer_heading strength={strength:.3f} alpha={alpha:.3f}"
                         f" steer_rate={slide_data.steer_rate:.2f}"
                         f" new_dir=({direction.x:.3f},{direction.y:.3f})",
                     )
 
-    # Backstop: never let steering accumulate far enough to reverse the slide, however the input is
-    # fed in. Anything past the limit is pinned to the edge of the allowed cone.
+    # The heading the slide opened with - the centre line of the turn cone.
     entry = Vector((slide_data.entry_x, slide_data.entry_y, 0.0))
     if entry.magnitude > 0:
+        # Cone half-angle expressed as a cosine so it compares directly against a dot product.
         cos_limit = math.cos(math.radians(slide_data.max_turn_degrees))
+        # How aligned the new heading is with the entry heading.
         along = direction.dot(entry)
+        # Outside the cone - clamp back onto its edge.
         if along < cos_limit:
+            # Component of the new heading perpendicular to entry - the side of the cone we're leaving on.
             perp = direction - entry * along
             if perp.magnitude > 0:
                 perp.normalize()
+                # Matching sin from the cosine limit, so the reconstructed vector stays unit-length.
                 sin_limit = math.sqrt(max(1.0 - cos_limit * cos_limit, 0.0))
+                # Rebuild the heading on the cone edge: cos along entry + sin along the side we left on.
                 direction = (entry * cos_limit + perp * sin_limit).normalize()
                 if verbose:
                     log.debug(
-                        f"apply_slide_physics clamp along={along:.3f} cos_limit={cos_limit:.3f}"
+                        f"steer_heading clamp along={along:.3f} cos_limit={cos_limit:.3f}"
                         f" clamped_dir=({direction.x:.3f},{direction.y:.3f})",
                     )
 
-    # Write the (possibly steered, possibly clamped) heading back into the state so the next
-    # frame's steering starts from where this one left off.
+    # Write the new heading back so the caller (injection / MoveAutonomous) picks it up.
     slide_data.dir_x = direction.x
     slide_data.dir_y = direction.y
 
-    # Derive absolute speed from the decay curve's speed_pct. SLIDE_SPEED_DEFAULT is where the
-    # curve opens; dividing by it scales the raw tuning to the start_speed captured on the state
-    # when the slide opened, which on the host is the value the client sent rather than the host's
-    # own slider.
-    speed = slide_data.start_speed * (slide_data.speed_pct / SLIDE_SPEED_DEFAULT)
 
-    # CrouchedPct is held clear of the actual slide speed so the engine's cap
-    # (CrouchedPct * GroundSpeed) can't clamp us; Velocity carries the actual forced motion.
-    pawn.CrouchedPct = max(SLIDE_SPEED_DEFAULT, (speed / max(pawn.GroundSpeed, 1.0)) * 2.0)
-    pawn.Velocity.X = direction.x * speed
-    pawn.Velocity.Y = direction.y * speed
+def compute_cap(slide_data: PlayerSlideState, ground_speed: float) -> float:
+    """Turn the decay curve into the CrouchedPct the pawn should hold this frame.
 
-    if verbose:
-        log.debug(
-            f"apply_slide_physics exit who={_who(pawn)} pct={slide_data.speed_pct:.3f}"
-            f" set={speed:.0f} dir=({direction.x:.3f},{direction.y:.3f})"
-            f" crouched_pct={pawn.CrouchedPct:.3f}",
-        )
+    `GroundSpeed * CrouchedPct` is walking physics' speed limit, so returning `slide_speed /
+    GroundSpeed` makes that limit equal the slide speed exactly - the engine accelerates the pawn up
+    to it and holds it there. slide_speed is the decay curve scaled to the owning player's
+    `start_speed` (captured at slide open), so a remote player's slide runs at their top speed.
+
+    Runs on: BOTH, from the slide driver. Stamped onto the pawn elsewhere - the injection hook for
+    our own pawn, the MoveAutonomous hook for a remote pawn on the host.
+    """
+    slide_speed = slide_data.start_speed * (slide_data.speed_pct / SLIDE_SPEED_DEFAULT)
+    return slide_speed / max(ground_speed, 1.0)
 
 
 __all__ = [
-    "apply_slide_physics",
     "can_slide",
+    "compute_cap",
     "slide",
+    "steer_heading",
 ]
