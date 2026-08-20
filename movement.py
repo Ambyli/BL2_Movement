@@ -1,12 +1,12 @@
 """The slide itself: how it decays, how it steers, and how its speed cap is derived.
 
-B* note: this module no longer writes `pawn.Velocity`. The slide is driven by the engine's own
-walking physics - `GroundSpeed * CrouchedPct` is the speed limit and the pawn's Acceleration is the
-heading - because that is the only motion a listen-server host reproduces for a remote client's pawn
-(it re-simulates each move from the replicated Acceleration, and ignores any Velocity we write on the
-proxy). So the per-frame job here is pure computation: advance the decay curve (`slide`), rotate the
-heading from steering input (`steer_heading`), and turn the curve into a CrouchedPct cap
-(`compute_cap`). The pawn writes live in `hooks` (own pawn) and the host's MoveAutonomous hook.
+Note: The slide is driven by the engine's own walking physics - `GroundSpeed * CrouchedPct` is the
+speed limit and the pawn's Acceleration is the heading - because that is the only motion a listen-server
+host reproduces for a remote client's pawn (it re-simulates each move from the replicated Acceleration,
+and ignores any Velocity we write on the proxy). So the per-frame job here is pure computation:
+advance the decay curve (`slide`), rotate the heading from steering input (`steer_heading`),
+and turn the curve into a CrouchedPct cap (`compute_cap`). The pawn writes live in `hooks` (own pawn)
+and the host's MoveAutonomous hook.
 """
 
 from __future__ import annotations
@@ -98,7 +98,9 @@ def slide(
 
     # Exit verdict: the decay bled below the walking-crouch floor, or the duration cap hit. Both
     # cutoffs come from state so a remote player's slide ends when their settings say it should.
-    spent = speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= slide_data.max_duration
+    spent = (
+        speed < CROUCHED_PCT_DEFAULT or slide_data.elapsed >= slide_data.max_duration
+    )
     if verbose:
         log.debug(
             f"slide exit speed_pct={speed:.3f} elapsed={slide_data.elapsed:.2f}"

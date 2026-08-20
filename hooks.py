@@ -225,6 +225,10 @@ def apply_remote_cap(
     heading needs no help here - it arrives in the replicated Acceleration the client forced. We only
     lift the cap, recomputed each driver tick into `state.cap`, so the re-sim is not clamped to crouch
     speed. PRE-hook so the cap is in place before this move's walking physics runs.
+
+    Also mirrors the replicated Acceleration into `state.dir_x/y` so the host's SLIDE_TICK diagnostic
+    tracks the remote player's actual steering. Read-only for physics - nothing on the host consumes
+    `state.dir_*` for a remote slide beyond that log line - so this is diagnostic-only sync.
     """
     if is_client():
         return
@@ -234,6 +238,16 @@ def apply_remote_cap(
     pawn = cast("WillowPlayerPawn", pc.Pawn)
     if pawn is None:
         return
+
+    # Keep the host's state heading in sync with the replicated Acceleration so debug/metrics reflect
+    # the remote player's actual steering.
+    accel = Vector(pawn.Acceleration)
+    accel.z = 0.0
+    if accel.magnitude > 0:
+        accel.normalize()
+        state.dir_x = accel.x
+        state.dir_y = accel.y
+
     pawn.CrouchedPct = state.cap
     if every_n(f"remote_cap_{player_id(pc)}", POST_LOG_EVERY):
         log.debug(f"remote_cap player={player_id(pc)} cap={state.cap:.2f}")
