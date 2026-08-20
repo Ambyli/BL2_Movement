@@ -232,6 +232,12 @@ def _log_slide_snapshot(
     )
 
 
+# DIAGNOSTIC (temporary): distinctive value stamped onto a remote pawn's CrouchedPct on the host, to
+# test whether the client's CrouchedPct replicates. Far outside the slide's own range (~0.5-2.2) so a
+# reading is unambiguous. See the CROUCH_REPL block in `_drive_slide`.
+_CROUCH_SENTINEL = 9.99
+
+
 def _drive_slide(
     pc_ref: WeakPointer[WillowPlayerController],
     state: PlayerSlideState,
@@ -269,6 +275,20 @@ def _drive_slide(
         # compare what the engine had this frame against what we are about to force onto it.
         pre_speed = math.hypot(pawn.Velocity.X, pawn.Velocity.Y) if verbose else 0.0
 
+        # DIAGNOSTIC (temporary): CrouchedPct replication probe, host side only. We stamped
+        # `_CROUCH_SENTINEL` at the end of last tick (below); read it now, before anything writes it,
+        # to see what the engine did to it over the frame. This is the B* gate:
+        #   ~= the client's decaying slide values (2.2 -> down) -> CrouchedPct replicates client->host
+        #   still == _CROUCH_SENTINEL                           -> free property, nothing syncs it
+        #   ~= 0.5-1.0 (engine crouch default)                  -> engine recomputes it; can't set-and-hold
+        # `state is not OWN_SLIDE_STATE` in a driver only ever means the host driving a remote slide.
+        is_remote_on_host = state is not OWN_SLIDE_STATE
+        if is_remote_on_host and verbose:
+            log.info(
+                f"CROUCH_REPL player={player_id(pc)} observed_crouched_pct={pawn.CrouchedPct:.3f}"
+                f" sentinel={_CROUCH_SENTINEL:.2f} bduck={bool(pc.bDuck)}",
+            )
+
         # Physical gate first, then the decay curve. Either ending the slide ends the driver.
         if not can_slide(pc, pawn, state) or slide(pawn, state, delta_time):
             log.info("_drive_slide teardown reason=gate_or_decay")
@@ -291,6 +311,13 @@ def _drive_slide(
                     log.warning(f"INPUT SEND FAILED {type(ex).__name__}: {ex}")
 
         apply_slide_physics(pawn, state, delta_time)
+
+        # DIAGNOSTIC (temporary): stamp the sentinel over apply_slide_physics's own CrouchedPct write,
+        # so next tick's CROUCH_REPL read shows whether anything (a replicated client value, or engine
+        # crouch physics) overwrote it during the frame. Harmless: the host pawn's position is not
+        # driven by our writes anyway - that's the bug - so lifting the cap here changes nothing seen.
+        if is_remote_on_host:
+            pawn.CrouchedPct = _CROUCH_SENTINEL
 
         if verbose:
             _log_slide_snapshot(pc, pawn, state, pre_speed, delta_time)
