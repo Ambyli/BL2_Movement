@@ -171,11 +171,6 @@ def inject_slide_heading(
     pin = getattr(pc, "PlayerInput", None)
     fwd, right = _view_basis(pc)
 
-    # The pawn's Acceleration right now is last frame's - the result of the axes we forced then.
-    # Logged below against the heading we intended, so a wrong view-basis sign shows up immediately.
-    prev = Vector(pawn.Acceleration)
-    prev.z = 0.0
-
     # 1) Read the player's RAW steering input (before we overwrite the axes) and project it to world.
     raw_f = raw_s = 0.0
     if pin is not None:
@@ -207,11 +202,9 @@ def inject_slide_heading(
     pawn.CrouchedPct = state.cap
 
     if every_n("inject", 30):
-        pmag = prev.magnitude
-        prev_dir = f"({prev.x / pmag:.2f},{prev.y / pmag:.2f})" if pmag > 1.0 else "(0,0)"
-        log.info(
-            f"INJECT dir=({state.dir_x:.2f},{state.dir_y:.2f}) prev_accel_dir={prev_dir}"
-            f" af={af:.2f} as={as_:.2f} cap={state.cap:.2f} input=({state.input_x:.2f},{state.input_y:.2f})",
+        log.debug(
+            f"inject dir=({state.dir_x:.2f},{state.dir_y:.2f}) cap={state.cap:.2f}"
+            f" input=({state.input_x:.2f},{state.input_y:.2f})",
         )
 
 
@@ -238,8 +231,8 @@ def apply_remote_cap(
     if pawn is None:
         return
     pawn.CrouchedPct = state.cap
-    if every_n(f"remotecap_{player_id(pc)}", 30):
-        log.info(f"REMOTE_CAP player={player_id(pc)} cap={state.cap:.2f} crouched_pct={pawn.CrouchedPct:.3f}")
+    if every_n(f"remote_cap_{player_id(pc)}", 30):
+        log.debug(f"remote_cap player={player_id(pc)} cap={state.cap:.2f}")
 
 
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,

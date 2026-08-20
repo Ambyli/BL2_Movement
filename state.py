@@ -59,11 +59,10 @@ class PlayerSlideState:
     speed_pct: float = SLIDE_SPEED_DEFAULT
     # Seconds this slide has been running, for the hard duration cap.
     elapsed: float = 0.0
-    # Steering input this frame. On the machine that owns the slide the driver samples the pawn's
-    # Acceleration into these; on the host's copy of a remote slide they arrive from the owning
-    # client via `server_slide_input`. Read this rather than pawn.Acceleration in the physics so the
-    # two machines always agree on what the player is pressing, without depending on Unreal's
-    # Acceleration replication being fresh across a movement frame.
+    # World-space steering input for this frame, on the machine that owns the slide: the injection
+    # hook writes the player's live input here before overwriting the pawn's axes, and steer_heading
+    # reads it. Stays zero on the host's copy of a remote slide - the host does not steer it; that
+    # heading arrives already-steered in the replicated Acceleration.
     input_x: float = 0.0
     input_y: float = 0.0
     # Slider-driven physics dials, snapshotted at slide open from the owning machine's
@@ -80,13 +79,6 @@ class PlayerSlideState:
     # MoveAutonomous hook (remote pawn on the host) read it and stamp it onto the pawn so the engine's
     # own movement drives the slide at slide speed on both machines.
     cap: float = 0.0
-    # DIAGNOSTIC (temporary): last frame's horizontal Location, so the driver can log how far the
-    # pawn actually moved between frames versus how far our forced velocity should have carried it.
-    # `has_prev_loc` guards the first frame, where there is nothing to diff against. Remove these
-    # three fields (and their use in `_log_slide_snapshot`) once the coast-vs-snap question is settled.
-    prev_loc_x: float = 0.0
-    prev_loc_y: float = 0.0
-    has_prev_loc: bool = False
 
 
 SLIDE_STATES: dict[int, PlayerSlideState] = {}
@@ -272,10 +264,6 @@ def begin_slide_state(
     # Open the cap at the curve's top so the very first frame - before the driver recomputes it - is
     # already clear of a clamp rather than zero (which would freeze the pawn for one frame).
     slide_data.cap = SLIDE_SPEED_DEFAULT
-    # DIAGNOSTIC (temporary): a fresh slide has no previous frame to diff Location against.
-    slide_data.prev_loc_x = 0.0
-    slide_data.prev_loc_y = 0.0
-    slide_data.has_prev_loc = False
     log.info(
         f"begin_slide_state exit speed_pct={slide_data.speed_pct:.3f}"
         f" entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"

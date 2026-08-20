@@ -134,7 +134,6 @@ def _log_slide_snapshot(
     pc: WillowPlayerController,
     pawn: WillowPlayerPawn,
     state: PlayerSlideState,
-    pre_speed: float,
     delta_time: float,
 ) -> None:
     """Emit one consolidated `SLIDE_TICK` line summarising a slide in progress.
@@ -152,22 +151,14 @@ def _log_slide_snapshot(
       is looking as they slide.
     - **turn_deg** - unsigned angle from entry heading to current heading; how much the slide has
       already curved (compare against `max_turn_degrees`).
-    - **input** - the raw steering vector driving that turn (sampled locally or arrived via
-      `server_slide_input`).
-    - **speed_forced / speed_actual** - what `apply_slide_physics` just wrote vs. what the engine
-      had entering the tick. A persistent gap between them is the signature of something else
-      (correction, walking physics, another mod) fighting our writes.
+    - **input** - the world-space steering input the owning player is feeding the slide this frame
+      (zero on the host's copy of a remote slide, which does not steer).
+    - **speed_forced / speed_actual** - the slide speed the decay curve calls for vs. the pawn's
+      actual horizontal speed. They should track closely; a persistent gap means walking physics is
+      not reaching the cap (aiming down sights, a slope, another mod).
     - **pct** - decay curve position, the same value `slide()` logs.
     - **elapsed / max, progress** - how close to the hard duration cap this slide is.
     - **ground, crouched_pct** - the two engine flags most likely to end a slide unexpectedly.
-    - **moved / expected / motion** - DIAGNOSTIC. `moved` is how far Location actually travelled
-      since the previous logged frame; `expected` is how far the forced horizontal speed should
-      have carried it over `delta`. With the driver throttle at 1 (one log per frame) these read
-      per-frame, and the `motion` tag classifies each frame: `coast` (moved ~= expected, the pawn
-      is riding our velocity smoothly), `SNAP` (moved >> expected, Location jumped - a ServerMove
-      correction landed), `STALL` (moved ~= 0 while expected is real - the pawn sat still waiting
-      for a net update). A slide that is `coast` throughout is smooth on the host; runs of STALL
-      punctuated by SNAP are the signature of net-driven position. Only meaningful at throttle 1.
 
     Kept in its own function to keep the driver body focused on the state machine. All the math
     below only runs when the driver is on a verbose tick, so extracting the call does not shift
@@ -191,30 +182,8 @@ def _log_slide_snapshot(
     else:
         turn_deg = 0.0
     forced_speed = state.start_speed * (state.speed_pct / SLIDE_SPEED_DEFAULT)
+    speed_actual = math.hypot(pawn.Velocity.X, pawn.Velocity.Y)
     progress = state.elapsed / state.max_duration if state.max_duration > 0 else 0.0
-
-    # DIAGNOSTIC (temporary): distance Location actually moved since the previous logged frame vs.
-    # how far our forced horizontal speed should have carried it. Classifies each frame as coast /
-    # SNAP / STALL so a scan of the log settles whether the host coasts the pawn smoothly or the
-    # engine snaps its position from ServerMoves. Only meaningful with the driver throttle at 1.
-    loc_x = float(pawn.Location.X)
-    loc_y = float(pawn.Location.Y)
-    expected = forced_speed * delta_time
-    if state.has_prev_loc:
-        moved = math.hypot(loc_x - state.prev_loc_x, loc_y - state.prev_loc_y)
-        ratio = moved / expected if expected > 0.001 else 0.0
-        if moved > max(expected * 2.0, 15.0):
-            motion = "SNAP"
-        elif expected > 5.0 and moved < expected * 0.25:
-            motion = "STALL"
-        else:
-            motion = "coast"
-        motion_field = f" moved={moved:.1f} expected={expected:.1f} ratio={ratio:.2f} motion={motion}"
-    else:
-        motion_field = f" moved=? expected={expected:.1f} ratio=? motion=first"
-    state.prev_loc_x = loc_x
-    state.prev_loc_y = loc_y
-    state.has_prev_loc = True
 
     log.debug(
         f"SLIDE_TICK who={player_id(pc)}"
@@ -222,12 +191,11 @@ def _log_slide_snapshot(
         f" facing_deg={yaw_deg:.1f} dir=({state.dir_x:.3f},{state.dir_y:.3f})"
         f" side_deg={side_deg:.1f} turn_deg={turn_deg:.1f}"
         f" input=({state.input_x:.2f},{state.input_y:.2f})"
-        f" speed_forced={forced_speed:.0f} speed_actual={pre_speed:.0f}"
+        f" speed_forced={forced_speed:.0f} speed_actual={speed_actual:.0f}"
         f" pct={state.speed_pct:.3f}"
         f" elapsed={state.elapsed:.2f}/{state.max_duration:.2f} progress={progress * 100:.0f}%"
         f" ground={pawn.IsOnGroundOrShortFall()} crouched_pct={pawn.CrouchedPct:.3f}"
-        f" delta={delta_time:.4f}"
-        f"{motion_field}",
+        f" delta={delta_time:.4f}",
     )
 
 
@@ -245,8 +213,8 @@ def _drive_slide(
     while True:
         yield WaitWhile(_paused)
 
-        # DIAGNOSTIC: back to 30 (coast-vs-snap is settled). Set to 1 again if you need a per-frame
-        # `moved`/`motion` trace; at 1 the log fills ~100 lines/s and rotates fast.
+        # One consolidated SLIDE_TICK line per this many frames - a slide costs a few lines, not
+        # hundreds. Drop to 1 for a per-frame trace when debugging.
         verbose = every_n("_drive_slide", 30)
         pc = pc_ref()
         pawn = None if pc is None else cast("WillowPlayerPawn", pc.Pawn)
@@ -264,10 +232,6 @@ def _drive_slide(
                 log.debug(f"_drive_slide skip reason=delta<=0 delta={delta_time:.4f}")
             continue
 
-        # Read the pawn's velocity BEFORE physics writes to it, so `_log_slide_snapshot` below can
-        # compare what the engine had this frame against what we are about to force onto it.
-        pre_speed = math.hypot(pawn.Velocity.X, pawn.Velocity.Y) if verbose else 0.0
-
         # Physical gate first, then the decay curve. Either ending the slide ends the driver.
         if not can_slide(pc, pawn, state) or slide(pawn, state, delta_time):
             log.info("_drive_slide teardown reason=gate_or_decay")
@@ -283,7 +247,7 @@ def _drive_slide(
         state.cap = compute_cap(state, pawn.GroundSpeed)
 
         if verbose:
-            _log_slide_snapshot(pc, pawn, state, pre_speed, delta_time)
+            _log_slide_snapshot(pc, pawn, state, delta_time)
 
 
 def begin_slide(
@@ -437,55 +401,6 @@ def server_announce_settings(
     )
 
 
-def _log_net_probe(pawn: WillowPlayerPawn, pc: WillowPlayerController) -> None:
-    """DIAGNOSTIC (temporary): dump the native net / movement knobs on a remote pawn, once per slide.
-
-    We suspect the host renders a remote sliding pawn from BL2's own movement replication rather
-    than from our forced-velocity writes, so the levers that would fix the teleporting live on these
-    engine properties, not in our code. This logs which of them actually exist on this build and
-    their current values, so we know what is tunable before trying to tune anything.
-
-    Every read is guarded: the exact property set varies across UE3 builds, and a name that is
-    absent here is itself a useful result (`<absent>`), not an error. Runs on the HOST only, from
-    `server_enter_slide`, so `pawn` is always a remote client's proxy - exactly the object whose
-    position is teleporting.
-    """
-    pawn_names = [
-        "NetUpdateFrequency",
-        "NetPriority",
-        "bReplicateMovement",
-        "bSmoothNetUpdates",
-        "bNetDirty",
-        "Physics",
-        "Role",
-        "RemoteRole",
-        "bAlwaysRelevant",
-        "NetUpdateTime",
-        "LastNetUpdateTime",
-        "bSimGravityDisabled",
-        "CustomTimeDilation",
-        "MeshTranslationOffset",
-    ]
-    pc_names = ["NetUpdateFrequency", "bUpdatePosition", "PlayerReplicationInfo"]
-    for name in pawn_names:
-        try:
-            log.info(f"NET_PROBE pawn.{name} = {getattr(pawn, name)}")
-        except Exception as ex:  # noqa: BLE001 - probing which props exist; absence is the result
-            log.info(f"NET_PROBE pawn.{name} = <absent:{type(ex).__name__}>")
-    for name in pc_names:
-        try:
-            log.info(f"NET_PROBE pc.{name} = {getattr(pc, name)}")
-        except Exception as ex:  # noqa: BLE001 - see above
-            log.info(f"NET_PROBE pc.{name} = <absent:{type(ex).__name__}>")
-    # CurrentNetSpeed (the per-connection bandwidth cap that throttles ServerMove rate) lives on the
-    # Player object, a hop off the controller - probed separately so a missing controller-side name
-    # above does not skip it.
-    try:
-        log.info(f"NET_PROBE pc.Player.CurrentNetSpeed = {pc.Player.CurrentNetSpeed}")
-    except Exception as ex:  # noqa: BLE001 - see above
-        log.info(f"NET_PROBE pc.Player.CurrentNetSpeed = <absent:{type(ex).__name__}>")
-
-
 @host.json_message
 def server_enter_slide(dir_x: float, dir_y: float) -> None:
     """Start the host's copy of a player's slide, on the heading they opened it on.
@@ -519,9 +434,6 @@ def server_enter_slide(dir_x: float, dir_y: float) -> None:
             f"SLIDE_ON who={player} start_speed={settings.start_speed:.0f}"
             f" dir=({dir_x:.2f},{dir_y:.2f}) n={len(SLIDE_STATES)}",
         )
-        # DIAGNOSTIC (temporary): one dump of the remote pawn's native net knobs at slide open.
-        if (pawn := cast("WillowPlayerPawn", pc.Pawn)) is not None:
-            _log_net_probe(pawn, pc)
     log.info(f"server_enter_slide exit started={started}")
 
 

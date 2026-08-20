@@ -33,16 +33,6 @@ POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds."""
 
 
-def _who(pawn: WillowPlayerPawn) -> str:
-    """Name the pawn a forced frame belongs to, as `Name#PlayerID`."""
-    try:
-        pri = pawn.Controller.PlayerReplicationInfo
-        return f"{pri.PlayerName}#{pri.PlayerID}"
-    except Exception as ex:  # noqa: BLE001 - a label is not worth raising over
-        log.debug(f"_who exit result=? reason={type(ex).__name__}")
-        return "?"
-
-
 def can_slide(
     pc: WillowPlayerController,
     pawn: WillowPlayerPawn,
