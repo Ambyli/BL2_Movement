@@ -74,6 +74,13 @@ class PlayerSlideState:
     max_duration: float = 0.0
     steer_rate: float = 0.0
     max_turn_degrees: float = 0.0
+    # DIAGNOSTIC (temporary): last frame's horizontal Location, so the driver can log how far the
+    # pawn actually moved between frames versus how far our forced velocity should have carried it.
+    # `has_prev_loc` guards the first frame, where there is nothing to diff against. Remove these
+    # three fields (and their use in `_log_slide_snapshot`) once the coast-vs-snap question is settled.
+    prev_loc_x: float = 0.0
+    prev_loc_y: float = 0.0
+    has_prev_loc: bool = False
 
 
 SLIDE_STATES: dict[int, PlayerSlideState] = {}
@@ -256,6 +263,10 @@ def begin_slide_state(
     slide_data.max_duration = settings.max_duration
     slide_data.steer_rate = settings.steer_rate
     slide_data.max_turn_degrees = settings.max_turn_degrees
+    # DIAGNOSTIC (temporary): a fresh slide has no previous frame to diff Location against.
+    slide_data.prev_loc_x = 0.0
+    slide_data.prev_loc_y = 0.0
+    slide_data.has_prev_loc = False
     log.info(
         f"begin_slide_state exit speed_pct={slide_data.speed_pct:.3f}"
         f" entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"
