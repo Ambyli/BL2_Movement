@@ -16,6 +16,7 @@ from coroutines import Time
 from uemath import Vector
 from unrealsdk import unreal
 
+from .constants import POST_LOG_EVERY
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
 from .movement import steer_heading
@@ -67,7 +68,7 @@ def handle_move(
 
     Runs on: BOTH, for the local player only.
     """
-    verbose = every_n("handle_move", 30)
+    verbose = every_n("handle_move", POST_LOG_EVERY)
     if verbose:
         log.debug(f"handle_move enter do_slide_jump={State.do_slide_jump}")
     if not State.do_slide_jump:
@@ -126,15 +127,9 @@ def handle_duck(
     log.info("handle_duck exit")
 
 
-# B* injection ------------------------------------------------------------------------------------
-# The slide is driven by the engine's own walking physics, not by forced velocity, because that is
-# the only motion a listen-server host reproduces for a remote client's pawn. Two pieces feed it:
-# this client/own-pawn hook forces the outgoing move to carry the slide heading (as input axes) plus
-# the speed cap (as CrouchedPct); the host's MoveAutonomous hook below holds the same cap on each
-# remote proxy so the server re-sim drives it at slide speed along the replicated heading.
-
-
-def _view_basis(pc: WillowPlayerController) -> tuple[tuple[float, float], tuple[float, float]]:
+def _view_basis(
+    pc: WillowPlayerController,
+) -> tuple[tuple[float, float], tuple[float, float]]:
     """Ground forward/right unit vectors for the controller's view yaw.
 
     UE yaw is 0 = +X, 16384 = +Y, so forward = (cos, sin). The engine builds world Acceleration from
@@ -171,37 +166,46 @@ def inject_slide_heading(
     pin = getattr(pc, "PlayerInput", None)
     fwd, right = _view_basis(pc)
 
-    # 1) Read the player's RAW steering input (before we overwrite the axes) and project it to world.
+    # Read the player's RAW steering input (before we overwrite the axes) and project it to world.
     raw_f = raw_s = 0.0
     if pin is not None:
         try:
             raw_f = float(pin.aForward)
             raw_s = float(pin.aStrafe)
-        except Exception:  # noqa: BLE001 - axis fields absent on some builds; no steering then
+        except (
+            Exception
+        ):  # noqa: BLE001 - axis fields absent on some builds; no steering then
             raw_f = raw_s = 0.0
     state.input_x = raw_f * fwd[0] + raw_s * right[0]
     state.input_y = raw_f * fwd[1] + raw_s * right[1]
 
-    # 2) Steer the heading from that input, this frame (zero lag).
+    # Steer the heading from that input, this frame (zero lag).
     steer_heading(state, Time.delta_time)
 
-    # 3) Overwrite the outgoing move to carry the slide heading: decompose the world heading back
+    # Overwrite the outgoing move to carry the slide heading: decompose the world heading back
     # into view-relative axes. |(af, as_)| == 1 for a unit heading, which is full input, so walking
     # physics accelerates to the full GroundSpeed * cap along the heading.
     af = state.dir_x * fwd[0] + state.dir_y * fwd[1]
     as_ = state.dir_x * right[0] + state.dir_y * right[1]
     if pin is not None:
-        for name, val in (("aForward", af), ("aBaseY", af), ("aStrafe", as_), ("aBaseX", as_)):
+        for name, val in (
+            ("aForward", af),
+            ("aBaseY", af),
+            ("aStrafe", as_),
+            ("aBaseX", as_),
+        ):
             try:
                 setattr(pin, name, val)
-            except Exception:  # noqa: BLE001 - set whichever axis fields this build exposes
+            except (
+                Exception
+            ):  # noqa: BLE001 - set whichever axis fields this build exposes
                 pass
 
-    # 4) Hold the speed cap so the pawn's own walking physics runs at slide speed - both for local
+    # Hold the speed cap so the pawn's own walking physics runs at slide speed - both for local
     # feel and so this machine's ServerMove reports a slide-speed move for the host to reproduce.
     pawn.CrouchedPct = state.cap
 
-    if every_n("inject", 30):
+    if every_n("inject", POST_LOG_EVERY):
         log.debug(
             f"inject dir=({state.dir_x:.2f},{state.dir_y:.2f}) cap={state.cap:.2f}"
             f" input=({state.input_x:.2f},{state.input_y:.2f})",
@@ -231,7 +235,7 @@ def apply_remote_cap(
     if pawn is None:
         return
     pawn.CrouchedPct = state.cap
-    if every_n(f"remote_cap_{player_id(pc)}", 30):
+    if every_n(f"remote_cap_{player_id(pc)}", POST_LOG_EVERY):
         log.debug(f"remote_cap player={player_id(pc)} cap={state.cap:.2f}")
 
 

@@ -22,6 +22,8 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from .constants import POST_LOG_EVERY
+
 LOG_PATH: Path = Path.home() / "bl2_slide_debug.log"
 """Bounded log file. Rotates rather than truncates, so a session that generates more than one file's
 worth still keeps the most recent lines."""
@@ -111,7 +113,7 @@ frames; keyed by a caller-chosen string so entry and exit logs of the same funct
 and stay aligned."""
 
 
-def every_n(key: str, n: int = 30) -> bool:
+def every_n(key: str, n: int = POST_LOG_EVERY) -> bool:
     """True on 1 out of every `n` calls under `key`. Used to throttle per-frame log lines.
 
     A slide driver ticks at frame rate for every active slide, and logging entry and exit on every

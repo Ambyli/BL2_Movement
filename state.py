@@ -13,7 +13,7 @@ from mods_base import ENGINE
 from uemath import Vector
 from unrealsdk import find_enum
 
-from .config import SLIDE_SPEED_DEFAULT
+from .constants import SLIDE_SPEED_DEFAULT
 from .debug import log
 
 if TYPE_CHECKING:
@@ -29,8 +29,8 @@ class State:
 
 @dataclass
 class PlayerSlideSettings:
-    """The five dials that shape a slide: start speed, decay curve, duration cap, steering rate
-    and turn cone.
+    """The dials that shape a slide: start speed, decay curve, duration cap, steering rate, turn
+    cone, and the two slope gains (downhill boost, uphill drag).
 
     Announced from every client to the host on slider change and again at slide open, so the host
     can drive a remote player's slide with the numbers that player tuned to rather than its own.
@@ -44,6 +44,8 @@ class PlayerSlideSettings:
     max_duration: float
     steer_rate: float
     max_turn_degrees: float
+    downhill_boost: float
+    uphill_drag: float
 
 
 @dataclass
@@ -73,6 +75,8 @@ class PlayerSlideState:
     max_duration: float = 0.0
     steer_rate: float = 0.0
     max_turn_degrees: float = 0.0
+    downhill_boost: float = 0.0
+    uphill_drag: float = 0.0
     # The CrouchedPct the pawn should hold this frame - GroundSpeed * cap is the walking-physics speed
     # limit, so `cap` IS the slide's speed governor now that velocity is no longer forced directly.
     # The driver recomputes it each tick from the decay curve; the injection hook (own pawn) and the
@@ -127,10 +131,12 @@ def default_settings() -> PlayerSlideSettings:
     log.debug("default_settings enter")
     from .config import (  # noqa: PLC0415 - deliberately lazy, see docstring
         decay_rate,
+        downhill_boost,
         max_duration,
         max_turn_degrees,
         start_speed,
         steer_rate,
+        uphill_drag,
     )
 
     result = PlayerSlideSettings(
@@ -139,11 +145,14 @@ def default_settings() -> PlayerSlideSettings:
         max_duration=max_duration.value,
         steer_rate=steer_rate.value,
         max_turn_degrees=max_turn_degrees.value,
+        downhill_boost=downhill_boost.value,
+        uphill_drag=uphill_drag.value,
     )
     log.debug(
         f"default_settings exit start_speed={result.start_speed:.0f} decay={result.decay_rate:.3f}"
         f" max_duration={result.max_duration:.2f} steer={result.steer_rate:.2f}"
-        f" max_turn={result.max_turn_degrees:.1f}",
+        f" max_turn={result.max_turn_degrees:.1f}"
+        f" downhill={result.downhill_boost:.4f} uphill={result.uphill_drag:.4f}",
     )
     return result
 
@@ -246,6 +255,7 @@ def begin_slide_state(
         f"begin_slide_state enter dir=({dir_x:.3f},{dir_y:.3f}) start_speed={settings.start_speed:.0f}"
         f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
         f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}"
+        f" downhill={settings.downhill_boost:.4f} uphill={settings.uphill_drag:.4f}"
         f" prior_speed_pct={slide_data.speed_pct:.3f} prior_elapsed={slide_data.elapsed:.2f}",
     )
     slide_data.speed_pct = SLIDE_SPEED_DEFAULT
@@ -261,6 +271,8 @@ def begin_slide_state(
     slide_data.max_duration = settings.max_duration
     slide_data.steer_rate = settings.steer_rate
     slide_data.max_turn_degrees = settings.max_turn_degrees
+    slide_data.downhill_boost = settings.downhill_boost
+    slide_data.uphill_drag = settings.uphill_drag
     # Open the cap at the curve's top so the very first frame - before the driver recomputes it - is
     # already clear of a clamp rather than zero (which would freeze the pawn for one frame).
     slide_data.cap = SLIDE_SPEED_DEFAULT
@@ -269,5 +281,6 @@ def begin_slide_state(
         f" entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"
         f" start_speed={slide_data.start_speed:.0f} decay={slide_data.decay_rate:.3f}"
         f" max_duration={slide_data.max_duration:.2f} steer={slide_data.steer_rate:.2f}"
-        f" max_turn={slide_data.max_turn_degrees:.1f}",
+        f" max_turn={slide_data.max_turn_degrees:.1f}"
+        f" downhill={slide_data.downhill_boost:.4f} uphill={slide_data.uphill_drag:.4f}",
     )

@@ -16,8 +16,9 @@ from typing import TYPE_CHECKING
 
 from uemath import Vector
 
-from .config import (
+from .constants import (
     CROUCHED_PCT_DEFAULT,
+    POST_LOG_EVERY,
     SLIDE_BACK_CUTOFF,
     SLIDE_SPEED_DEFAULT,
     SLIDE_STEER_DEADZONE,
@@ -27,10 +28,6 @@ from .state import PlayerSlideState
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
-
-
-POST_LOG_EVERY: int = 30
-"""One line per this many forced frames, so a slide costs a handful of lines rather than hundreds."""
 
 
 def can_slide(
@@ -81,10 +78,10 @@ def slide(
     # (captured at slide open from the owning player's settings) so the host runs the client's curve.
     speed = slide_data.speed_pct - delta_time * slide_data.decay_rate
     if z_diff < 0:
-        speed -= z_diff * 0.0005  # downhill, wins some speed back
+        speed -= z_diff * slide_data.downhill_boost  # downhill, wins some speed back
         slope = "downhill"
     else:
-        speed -= z_diff * 0.004  # uphill, sheds extra
+        speed -= z_diff * slide_data.uphill_drag  # uphill, sheds extra
         slope = "uphill"
     if verbose:
         log.debug(
@@ -124,20 +121,31 @@ def steer_heading(slide_data: PlayerSlideState, delta_time: float) -> None:
     arrives already-steered in the replicated Acceleration).
     """
     verbose = every_n("steer_heading", POST_LOG_EVERY)
+    # Current slide heading, read straight off state.
     direction = Vector((slide_data.dir_x, slide_data.dir_y, 0.0))
+    # Nothing to steer if we somehow don't have a heading yet.
     if direction.magnitude == 0:
         return
 
+    # This frame's steering input as a world-space vector - the injection hook wrote it here.
     accel = Vector((slide_data.input_x, slide_data.input_y, 0.0))
     if accel.magnitude > 0:
+        # Direction of intent only; strength comes back through the vector's length below.
         accel.normalize()
+        # Dot against the heading tells us how much of the input points backwards along the slide.
         backwards = accel.dot(direction)
+        # Reject input that's more backwards than the cutoff allows - can't u-turn a slide.
         if backwards > SLIDE_BACK_CUTOFF:
+            # Partially-backwards input: strip its heading-parallel component so only sideways pull remains.
             if backwards < 0:
                 accel = accel - direction * backwards
+            # The leftover sideways magnitude scales how hard we turn this frame.
             strength = accel.magnitude
+            # Anything under the deadzone is noise from a resting stick.
             if strength > SLIDE_STEER_DEADZONE:
+                # Turn factor this frame: rate x dt x how-hard-you're-pushing, capped at a full rotate.
                 alpha = min(slide_data.steer_rate * delta_time * strength, 1.0)
+                # Ease from current heading toward the input direction by that factor.
                 direction = direction.lerp(accel.normalize(), alpha).normalize()
                 if verbose:
                     log.debug(
@@ -146,15 +154,22 @@ def steer_heading(slide_data: PlayerSlideState, delta_time: float) -> None:
                         f" new_dir=({direction.x:.3f},{direction.y:.3f})",
                     )
 
+    # The heading the slide opened with - the centre line of the turn cone.
     entry = Vector((slide_data.entry_x, slide_data.entry_y, 0.0))
     if entry.magnitude > 0:
+        # Cone half-angle expressed as a cosine so it compares directly against a dot product.
         cos_limit = math.cos(math.radians(slide_data.max_turn_degrees))
+        # How aligned the new heading is with the entry heading.
         along = direction.dot(entry)
+        # Outside the cone - clamp back onto its edge.
         if along < cos_limit:
+            # Component of the new heading perpendicular to entry - the side of the cone we're leaving on.
             perp = direction - entry * along
             if perp.magnitude > 0:
                 perp.normalize()
+                # Matching sin from the cosine limit, so the reconstructed vector stays unit-length.
                 sin_limit = math.sqrt(max(1.0 - cos_limit * cos_limit, 0.0))
+                # Rebuild the heading on the cone edge: cos along entry + sin along the side we left on.
                 direction = (entry * cos_limit + perp * sin_limit).normalize()
                 if verbose:
                     log.debug(
@@ -162,6 +177,7 @@ def steer_heading(slide_data: PlayerSlideState, delta_time: float) -> None:
                         f" clamped_dir=({direction.x:.3f},{direction.y:.3f})",
                     )
 
+    # Write the new heading back so the caller (injection / MoveAutonomous) picks it up.
     slide_data.dir_x = direction.x
     slide_data.dir_y = direction.y
 

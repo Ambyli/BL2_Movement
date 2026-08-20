@@ -24,7 +24,7 @@ from networking.decorators import host
 from unrealsdk.unreal import WeakPointer
 
 from . import events
-from .config import CROUCHED_PCT_DEFAULT, SLIDE_SPEED_DEFAULT
+from .constants import CROUCHED_PCT_DEFAULT, POST_LOG_EVERY, SLIDE_SPEED_DEFAULT
 from .debug import every_n, log
 from .movement import can_slide, compute_cap, slide
 from .state import (
@@ -52,7 +52,7 @@ def _paused() -> bool:
     A read that fails mid-transition counts as not paused, so the driver falls through to its own
     teardown check on the next tick rather than stalling forever on a controller that is gone.
     """
-    verbose = every_n("_paused", 30)
+    verbose = every_n("_paused", POST_LOG_EVERY)
     if verbose:
         log.debug("_paused enter")
     try:
@@ -215,7 +215,7 @@ def _drive_slide(
 
         # One consolidated SLIDE_TICK line per this many frames - a slide costs a few lines, not
         # hundreds. Drop to 1 for a per-frame trace when debugging.
-        verbose = every_n("_drive_slide", 30)
+        verbose = every_n("_drive_slide", POST_LOG_EVERY)
         pc = pc_ref()
         pawn = None if pc is None else cast("WillowPlayerPawn", pc.Pawn)
         if pc is None or pawn is None:
@@ -270,6 +270,7 @@ def begin_slide(
         f"begin_slide enter dir=({dir_x:.3f},{dir_y:.3f}) start_speed={settings.start_speed:.0f}"
         f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
         f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}"
+        f" downhill={settings.downhill_boost:.4f} uphill={settings.uphill_drag:.4f}"
         f" have_state={state is not None} live_slides={len(SLIDE_STATES)}",
     )
     if (player := player_id(pc)) is None or (pawn := cast("WillowPlayerPawn", pc.Pawn)) is None:
@@ -350,7 +351,8 @@ def _announce_settings_to_host(settings: PlayerSlideSettings) -> None:
     log.info(
         f"_announce_settings_to_host enter start_speed={settings.start_speed:.0f}"
         f" decay={settings.decay_rate:.3f} max_duration={settings.max_duration:.2f}"
-        f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}",
+        f" steer={settings.steer_rate:.2f} max_turn={settings.max_turn_degrees:.1f}"
+        f" downhill={settings.downhill_boost:.4f} uphill={settings.uphill_drag:.4f}",
     )
     server_announce_settings(
         settings.start_speed,
@@ -358,6 +360,8 @@ def _announce_settings_to_host(settings: PlayerSlideSettings) -> None:
         settings.max_duration,
         settings.steer_rate,
         settings.max_turn_degrees,
+        settings.downhill_boost,
+        settings.uphill_drag,
     )
     log.info("_announce_settings_to_host exit")
 
@@ -369,8 +373,10 @@ def server_announce_settings(
     max_duration_v: float,
     steer_rate_v: float,
     max_turn_degrees_v: float,
+    downhill_boost_v: float,
+    uphill_drag_v: float,
 ) -> None:
-    """Cache the sender's five slider values on the host, keyed by their PlayerID.
+    """Cache the sender's slider values on the host, keyed by their PlayerID.
 
     Runs on: HOST only. Fired by every client whenever its own sliders change, and once by every
     client at the top of `enter_slide` so the host has fresh values before the enter RPC arrives.
@@ -383,7 +389,8 @@ def server_announce_settings(
     log.info(
         f"server_announce_settings enter start_speed={start_speed_v:.0f}"
         f" decay={decay_rate_v:.3f} max_duration={max_duration_v:.2f}"
-        f" steer={steer_rate_v:.2f} max_turn={max_turn_degrees_v:.1f}",
+        f" steer={steer_rate_v:.2f} max_turn={max_turn_degrees_v:.1f}"
+        f" downhill={downhill_boost_v:.4f} uphill={uphill_drag_v:.4f}",
     )
     pc = cast("WillowPlayerController", server_announce_settings.sender.Owner)
     if pc is None or (player := player_id(pc)) is None:
@@ -395,6 +402,8 @@ def server_announce_settings(
         max_duration=max_duration_v,
         steer_rate=steer_rate_v,
         max_turn_degrees=max_turn_degrees_v,
+        downhill_boost=downhill_boost_v,
+        uphill_drag=uphill_drag_v,
     )
     log.info(
         f"server_announce_settings exit stored player={player} known_players={len(PLAYER_SETTINGS)}",

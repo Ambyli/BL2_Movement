@@ -41,19 +41,6 @@ def _on_slider_change(*_: object) -> None:
         log.warning(f"SLIDER ANNOUNCE FAILED {type(ex).__name__}: {ex}")
     log.info("_on_slider_change exit")
 
-# Structural rather than feel dials, so they stay constants. SLIDE_SPEED_DEFAULT is where speed_pct
-# opens and the top of the decay range; CROUCHED_PCT_DEFAULT is both normal crouch speed and the
-# cutoff the decay ends at. Moving either rescales the whole curve instead of tuning anything.
-SLIDE_SPEED_DEFAULT: float = 2.2
-CROUCHED_PCT_DEFAULT: float = 0.5
-
-# Input pointing further than this back down the slide is ignored outright. -0.5 is 120 degrees off
-# the heading, so back, back-left and back-right are all inert.
-SLIDE_BACK_CUTOFF: float = -0.5
-# Sideways input weaker than this does not steer at all. Without it, an input that is very nearly
-# straight backwards leaves a sliver of a sideways component that still creeps the heading round.
-SLIDE_STEER_DEADZONE: float = 0.1
-
 start_speed = SliderOption(
     "Slide Speed",
     970.0,
@@ -122,9 +109,45 @@ max_turn_degrees = SliderOption(
     on_change=_on_slider_change,
 )
 
+downhill_boost = SliderOption(
+    "Downhill Boost",
+    0.0005,
+    0.0,
+    0.02,
+    0.0005,
+    is_integer=False,
+    description=(
+        "Speed a slide wins back per unreal unit of downhill drop each frame. 0 disables slope"
+        " gain, so downhill runs decay at the flat-ground rate."
+    ),
+    on_change=_on_slider_change,
+)
+
+uphill_drag = SliderOption(
+    "Uphill Drag",
+    0.004,
+    0.0,
+    0.02,
+    0.0005,
+    is_integer=False,
+    description=(
+        "Extra speed a slide sheds per unreal unit of uphill rise each frame, on top of the"
+        " normal time decay. 0 disables slope drag."
+    ),
+    on_change=_on_slider_change,
+)
+
 all_options = [
     GroupedOption(
         "Sliding",
-        (start_speed, decay_rate, max_duration, steer_rate, max_turn_degrees),
+        (
+            start_speed,
+            decay_rate,
+            max_duration,
+            steer_rate,
+            max_turn_degrees,
+            downhill_boost,
+            uphill_drag,
+        ),
     ),
 ]
