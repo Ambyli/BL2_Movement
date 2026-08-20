@@ -137,13 +137,15 @@ def handle_duck(
 def _view_basis(pc: WillowPlayerController) -> tuple[tuple[float, float], tuple[float, float]]:
     """Ground forward/right unit vectors for the controller's view yaw.
 
-    UE yaw is 0 = +X, 16384 = +Y, so forward = (cos, sin) and right is 90 degrees clockwise from it,
-    (sin, -cos). These convert between the pawn's view-relative input axes and world headings. If a
-    built slide comes out mirrored, the sign of `right` is the one knob to flip.
+    UE yaw is 0 = +X, 16384 = +Y, so forward = (cos, sin). The engine builds world Acceleration from
+    the input axes with right = (-sin, cos), and the decompose/recompose round-trip is the identity
+    only when we use that same right - the mirrored sign (sin, -cos) reflects the heading across the
+    view-forward axis, which makes the slide appear to track facing. Verified against an INJECT trace
+    (intended dir vs. resulting Acceleration had a flipped Y).
     """
     theta = float(pc.Rotation.Yaw) * (math.tau / 65536.0)
     c, s = math.cos(theta), math.sin(theta)
-    return (c, s), (s, -c)
+    return (c, s), (-s, c)
 
 
 @hook("WillowGame.WillowPlayerController:PlayerWalking.PlayerMove")
