@@ -124,67 +124,83 @@ def handle_duck(
 
 
 # DIAGNOSTIC (temporary) --------------------------------------------------------------------------
-# Measure the real inter-arrival interval of ServerMove on the host, per remote player, to settle
-# whether the ~4Hz teleport cadence is the client's move-send rate (NetMoveDelta predicts ~45Hz) or
-# something downstream. ServerMove executes server-side, so these fire on the HOST only, and only
-# for remote clients' pawns (the host's own pawn is authoritative locally and never routes movement
-# through ServerMove). Remove this whole block once the send rate is confirmed.
-_sm_last: dict[int, float] = {}
-_sm_sum: dict[int, float] = {}
-_sm_count: dict[int, int] = {}
+# Measure the real inter-arrival interval of the client's server-move RPCs on the host, per player
+# and per variant, to settle whether the ~4Hz teleport cadence is the move-send rate (NetMoveDelta
+# predicts ~45Hz) or something downstream. These execute server-side, so they fire on the HOST only,
+# and only for remote clients' pawns (the host's own pawn is authoritative locally and never routes
+# movement through them). Function names come from the prior discovery.py: the move RPCs live on
+# Engine.PlayerController (Willow does not override them), except ShortServerMove which is Willow's.
+# Tracked per (player, variant) so we see exactly which path BL2 uses and its rate, without any one
+# variant's count polluting another's. Remove this whole block once the send rate is confirmed.
+_sm_last: dict[tuple[int, str], float] = {}
+_sm_sum: dict[tuple[int, str], float] = {}
+_sm_count: dict[tuple[int, str], int] = {}
 
 
 def _record_servermove(obj: unreal.UObject, variant: str) -> None:
-    """Fold one ServerMove receipt into the per-player interval average, logging every 30th."""
+    """Fold one server-move receipt into the per-(player, variant) interval average, logging every 30th."""
     pc = cast("WillowPlayerController", obj)
     player = player_id(pc)
     if player is None:
         return
+    key = (player, variant)
     now = time.perf_counter()
-    last = _sm_last.get(player)
-    _sm_last[player] = now
+    last = _sm_last.get(key)
+    _sm_last[key] = now
     if last is None:
         return
     dt = now - last
-    _sm_sum[player] = _sm_sum.get(player, 0.0) + dt
-    _sm_count[player] = _sm_count.get(player, 0) + 1
-    if every_n(f"servermove_{player}", 30):
-        n = _sm_count[player]
-        avg = _sm_sum[player] / n if n else 0.0
+    _sm_sum[key] = _sm_sum.get(key, 0.0) + dt
+    _sm_count[key] = _sm_count.get(key, 0) + 1
+    if every_n(f"sm_{player}_{variant}", 30):
+        n = _sm_count[key]
+        avg = _sm_sum[key] / n if n else 0.0
         hz = 1.0 / avg if avg > 0 else 0.0
         log.info(
-            f"SERVERMOVE_RATE player={player} last_variant={variant}"
+            f"SERVERMOVE_RATE player={player} variant={variant}"
             f" avg_interval={avg * 1000:.1f}ms rate={hz:.1f}Hz last_dt={dt * 1000:.1f}ms"
             f" samples={n}",
         )
-        _sm_sum[player] = 0.0
-        _sm_count[player] = 0
+        _sm_sum[key] = 0.0
+        _sm_count[key] = 0
 
 
-@hook("WillowGame.WillowPlayerController:ServerMove")
-def probe_server_move(
-    obj: unreal.UObject,
-    _args: unreal.WrappedStruct,
-    _ret: Any,
-    _func: unreal.BoundFunction,
-) -> None:
-    """DIAGNOSTIC (temporary): single-move ServerMove receipt. Runs on: HOST, remote pawns only."""
-    _record_servermove(obj, "single")
+# One hook per known server-move RPC. PCServerMoveInner is the consolidated inner handler the others
+# funnel into, so it should show the true aggregate rate; the rest show which specific path fires.
+@hook("Engine.PlayerController:ServerMove")
+def probe_server_move(obj: unreal.UObject, _a: unreal.WrappedStruct, _r: Any, _f: unreal.BoundFunction) -> None:
+    """DIAGNOSTIC (temporary): ServerMove receipt. Runs on: HOST, remote pawns only."""
+    _record_servermove(obj, "ServerMove")
 
 
-@hook("WillowGame.WillowPlayerController:ServerMoveDual")
-def probe_server_move_dual(
-    obj: unreal.UObject,
-    _args: unreal.WrappedStruct,
-    _ret: Any,
-    _func: unreal.BoundFunction,
-) -> None:
-    """DIAGNOSTIC (temporary): dual (combined) ServerMove receipt. Runs on: HOST, remote pawns only."""
-    _record_servermove(obj, "dual")
+@hook("Engine.PlayerController:DualServerMove")
+def probe_dual_server_move(obj: unreal.UObject, _a: unreal.WrappedStruct, _r: Any, _f: unreal.BoundFunction) -> None:
+    """DIAGNOSTIC (temporary): DualServerMove receipt. Runs on: HOST, remote pawns only."""
+    _record_servermove(obj, "DualServerMove")
+
+
+@hook("Engine.PlayerController:PCServerMoveInner")
+def probe_pc_server_move_inner(obj: unreal.UObject, _a: unreal.WrappedStruct, _r: Any, _f: unreal.BoundFunction) -> None:
+    """DIAGNOSTIC (temporary): consolidated inner move handler. Runs on: HOST, remote pawns only."""
+    _record_servermove(obj, "PCServerMoveInner")
+
+
+@hook("WillowGame.WillowPlayerController:ShortServerMove")
+def probe_short_server_move(obj: unreal.UObject, _a: unreal.WrappedStruct, _r: Any, _f: unreal.BoundFunction) -> None:
+    """DIAGNOSTIC (temporary): Willow's compressed move variant. Runs on: HOST, remote pawns only."""
+    _record_servermove(obj, "ShortServerMove")
 
 
 # ---------------------------------------------------------------------------------------------------
 
 # Passed explicitly to build_mod: it only gathers hooks from the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
-all_hooks = [handle_move, handle_duck, jump, probe_server_move, probe_server_move_dual]
+all_hooks = [
+    handle_move,
+    handle_duck,
+    jump,
+    probe_server_move,
+    probe_dual_server_move,
+    probe_pc_server_move_inner,
+    probe_short_server_move,
+]
