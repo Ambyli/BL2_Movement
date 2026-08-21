@@ -25,6 +25,7 @@ from .constants import (
     SLIDE_STEER_DEADZONE,
 )
 from .debug import every_n, log
+from .gating import optimistic
 from .state import PlayerSlideState
 
 if TYPE_CHECKING:
@@ -36,42 +37,31 @@ def can_slide(
     pawn: WillowPlayerPawn,
     slide_data: PlayerSlideState,
 ) -> bool:
-    """Whether this slide should still be running.
+    """Whether this slide is physically valid this frame: flagged live, crouch held, on the ground.
+
+    Pure predicate, no side effects. The netcode-race tolerance that keeps a just-opened host shadow
+    alive until the crouch flag replicates lives in `_drive_slide`'s arming latch, not here - so this
+    stays an honest "is the slide valid right now" question any caller can trust.
 
     Runs on: BOTH. `bDuck` reaches the host for a remote player through the move stream's compressed
-    flags - but the `server_enter_slide` RPC that opens the host's shadow travels a separate, faster
-    channel and routinely beats that flag there. So on the host's first driver tick `bDuck` can read
-    false purely because the crouch state has not replicated yet, not because the player let go.
-    Ending the slide on that reading kills the shadow before `apply_remote_cap` ever lifts the cap,
-    and the remote player is re-simulated at stock crouch speed for the whole slide.
-
-    The arming latch bridges that race: until `bDuck` has been seen true once (`armed`), a false
-    reading inside the `HOST_ARM_GRACE` window means "not replicated yet" and holds the slide open so
-    the cap-lift survives. Once armed - immediate on the owning machine, where the local press sets
-    `bDuck` the same frame - the normal gate applies and releasing crouch ends the slide. `slide`'s
-    decay and duration cap still bound a shadow whose flag never arrives.
+    flags, so the same gate reads true on both machines once that flag has landed.
     """
     verbose = every_n("can_slide", POST_LOG_EVERY)
-    ducking = bool(pc.bDuck)
-    grounded = pawn.IsOnGroundOrShortFall()
-    if ducking:
-        slide_data.armed = True
+    result = slide_data.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
     if verbose:
         log.debug(
-            f"can_slide enter is_sliding={slide_data.is_sliding} bDuck={ducking}"
-            f" on_ground={grounded} armed={slide_data.armed} elapsed={slide_data.elapsed:.3f}",
+            f"can_slide is_sliding={slide_data.is_sliding} bDuck={bool(pc.bDuck)}"
+            f" on_ground={pawn.IsOnGroundOrShortFall()} result={result}",
         )
-    if not slide_data.is_sliding:
-        result = False
-    elif not slide_data.armed and slide_data.elapsed < HOST_ARM_GRACE:
-        # Shadow opened by the enter RPC but the crouch flag has not landed yet: hold it open rather
-        # than tearing down on frame one, so the cap-lift is in place when the flag arrives.
-        result = True
-    else:
-        result = ducking and grounded
-    if verbose:
-        log.debug(f"can_slide exit result={result}")
     return result
+
+
+slide_gate = optimistic(HOST_ARM_GRACE)(can_slide)
+"""`can_slide` as an optimistic gate: a just-opened host shadow - whose enter RPC outran the
+replicated crouch flag - is held open through `HOST_ARM_GRACE` until the flag lands and the pure gate
+passes, then latches and defers to it. Transparent on the owning machine, which passes on frame one.
+This is what `_drive_slide` (and any future slide driver) calls; the tolerance lives in
+`gating.optimistic`, so nothing re-implements it. See gating.py."""
 
 
 def slide(
@@ -225,5 +215,6 @@ __all__ = [
     "can_slide",
     "compute_cap",
     "slide",
+    "slide_gate",
     "steer_heading",
 ]

@@ -83,11 +83,12 @@ class PlayerSlideState:
     # MoveAutonomous hook (remote pawn on the host) read it and stamp it onto the pawn so the engine's
     # own movement drives the slide at slide speed on both machines.
     cap: float = 0.0
-    # Whether the owning machine's crouch flag (`bDuck`) has been seen true for this slide yet. The
-    # host opens its shadow from the enter RPC, which outruns the replicated `bDuck`, so the gate in
-    # `can_slide` must not end the slide on a not-yet-arrived flag. Latched true on the first ducking
-    # frame - immediate on the owning machine, where the local press sets `bDuck` the same frame -
-    # after which releasing crouch ends the slide as normal. Reset per slide in begin_slide_state.
+    # Latch for the optimistic slide gate (`movement.slide_gate`, built on `gating.optimistic`): the
+    # host opens its shadow from the enter RPC, which outruns the replicated crouch flag, so the gate
+    # must not end the slide on a not-yet-arrived flag. Set true the first frame the gate passes -
+    # immediate on the owning machine, where the local press is already applied - after which the gate
+    # defers to the plain crouch/ground check. Reset in begin_slide_state. Satisfies gating.Confirmable
+    # together with `elapsed` above.
     armed: bool = False
 
 

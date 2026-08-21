@@ -26,7 +26,7 @@ from unrealsdk.unreal import WeakPointer
 from . import events
 from .constants import CROUCHED_PCT_DEFAULT, POST_LOG_EVERY, SLIDE_SPEED_DEFAULT
 from .debug import every_n, log
-from .movement import can_slide, compute_cap, slide
+from .movement import compute_cap, slide, slide_gate
 from .state import (
     OWN_SLIDE_STATE,
     PLAYER_SETTINGS,
@@ -232,9 +232,14 @@ def _drive_slide(
                 log.debug(f"_drive_slide skip reason=delta<=0 delta={delta_time:.4f}")
             continue
 
-        # Physical gate first, then the decay curve. Either ending the slide ends the driver.
-        if not can_slide(pc, pawn, state) or slide(pawn, state, delta_time):
-            log.info("_drive_slide teardown reason=gate_or_decay")
+        # Race-tolerant gate first, then the decay curve. Either ending the slide ends the driver.
+        # slide_gate is can_slide wrapped as an optimistic gate, so a just-opened host shadow survives
+        # until the crouch flag replicates - see movement.slide_gate / gating.optimistic.
+        if not slide_gate(pc, pawn, state) or slide(pawn, state, delta_time):
+            log.info(
+                f"_drive_slide teardown reason=gate_or_decay armed={state.armed}"
+                f" elapsed={state.elapsed:.3f}",
+            )
             _end_slide(pc, pawn, state)
             log.info("_drive_slide exit reason=slide_ended")
             return
