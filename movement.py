@@ -56,12 +56,17 @@ def can_slide(
     return result
 
 
-slide_gate = optimistic(HOST_ARM_GRACE)(can_slide)
-"""`can_slide` as an optimistic gate: a just-opened host shadow - whose enter RPC outran the
-replicated crouch flag - is held open through `HOST_ARM_GRACE` until the flag lands and the pure gate
-passes, then latches and defers to it. Transparent on the owning machine, which passes on frame one.
-This is what `_drive_slide` (and any future slide driver) calls; the tolerance lives in
-`gating.optimistic`, so nothing re-implements it. See gating.py."""
+slide_gate = optimistic(
+    HOST_ARM_GRACE,
+    confirm=lambda pc, *_: bool(pc.bDuck),
+)(can_slide)
+"""`can_slide` as an optimistic gate. A just-opened host shadow - whose enter RPC outran the
+replicated crouch flag - is held open through `HOST_ARM_GRACE` until that flag lands, then the plain
+crouch/ground gate rules. The confirm signal is `bDuck` alone, not the whole gate: being on the ground
+is an always-local condition, not the thing that replicates late, so it must not gate the arming.
+Transparent on the owning machine, where the local press is already applied. This is what
+`_drive_slide` (and any future slide driver) calls; the tolerance lives in `gating.optimistic`, so
+nothing re-implements it. See gating.py."""
 
 
 def slide(

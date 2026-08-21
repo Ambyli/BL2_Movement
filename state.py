@@ -85,10 +85,10 @@ class PlayerSlideState:
     cap: float = 0.0
     # Latch for the optimistic slide gate (`movement.slide_gate`, built on `gating.optimistic`): the
     # host opens its shadow from the enter RPC, which outruns the replicated crouch flag, so the gate
-    # must not end the slide on a not-yet-arrived flag. Set true the first frame the gate passes -
-    # immediate on the owning machine, where the local press is already applied - after which the gate
-    # defers to the plain crouch/ground check. Reset in begin_slide_state. Satisfies gating.Confirmable
-    # together with `elapsed` above.
+    # must not end the slide on a not-yet-arrived flag. Set true once the crouch flag (`bDuck`, the
+    # confirm signal) is seen - immediate on the owning machine, where the local press is already
+    # applied - after which the gate defers to the plain crouch/ground check. Reset in
+    # begin_slide_state. Satisfies gating.Confirmable together with `elapsed` above.
     armed: bool = False
 
 
