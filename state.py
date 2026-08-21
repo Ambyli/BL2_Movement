@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 from mods_base import ENGINE
 from uemath import Vector
-from unrealsdk import find_enum
+from unrealsdk import find_all, find_enum
 
 from .constants import SLIDE_SPEED_DEFAULT
 from .debug import log
@@ -203,6 +203,25 @@ def player_id(pc: WillowPlayerController) -> int | None:
     result = int(pri.PlayerID)
     log.debug(f"player_id exit result={result}")
     return result
+
+
+def pawn_for_player_id(player: int) -> WillowPlayerPawn | None:
+    """The local WillowPlayerPawn belonging to a given PlayerID, or None if not found on this machine.
+
+    Works on every machine: a pawn carries its owner's `PlayerReplicationInfo` as a replicated
+    property, so matching on `PlayerID` finds a remote player's proxy on a client just as it finds a
+    real pawn on the host. That is what the third-person pose needs - it fires on all machines keyed
+    by the PlayerID the host broadcast, and each machine has to turn that id back into its own copy of
+    the pawn.
+    """
+    log.debug(f"pawn_for_player_id enter player={player}")
+    for pawn in find_all("WillowPlayerPawn"):
+        pri = getattr(pawn, "PlayerReplicationInfo", None)
+        if pri is not None and int(pri.PlayerID) == player:
+            log.debug(f"pawn_for_player_id exit found pawn={pawn}")
+            return cast("WillowPlayerPawn", pawn)
+    log.debug(f"pawn_for_player_id exit result=None player={player}")
+    return None
 
 
 def state_for(pc: WillowPlayerController) -> PlayerSlideState | None:

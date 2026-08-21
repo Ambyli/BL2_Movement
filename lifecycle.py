@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, cast
 
 from coroutines import Time, WaitWhile, start_coroutine_tick
 from mods_base import get_pc
-from networking.decorators import host
+from networking.decorators import broadcast, host
 from unrealsdk.unreal import WeakPointer
 
 from . import events
@@ -37,6 +37,7 @@ from .state import (
     default_settings,
     heading_from,
     is_client,
+    pawn_for_player_id,
     player_id,
     state_for,
 )
@@ -107,6 +108,15 @@ def _end_slide(
     if pawn is not None:
         pawn.CrouchedPct = CROUCHED_PCT_DEFAULT
         log.info(f"_end_slide reset CrouchedPct={pawn.CrouchedPct:.3f}")
+    # Mirror of the begin_slide broadcast: the host clears the pose on every machine, for its own and
+    # remote slides alike. The player id comes off the controller while we still have it; a teardown
+    # after disconnect (pc gone) skips it, but then the pawn is gone on every machine anyway, so there
+    # is nothing left leaning.
+    if not is_client() and pc is not None and (pose_player := player_id(pc)) is not None:
+        try:
+            net_slide_pose(pose_player, on=False)
+        except Exception as ex:  # noqa: BLE001 - a failed pose broadcast must never wedge teardown
+            log.warning(f"POSE OFF SEND FAILED {type(ex).__name__}: {ex}")
     if state is not OWN_SLIDE_STATE:
         log.info("_end_slide exit reason=remote_slide")
         return
@@ -301,6 +311,14 @@ def begin_slide(
     # from the very first frame, before the driver's first tick lands.
     pawn.CrouchedPct = SLIDE_SPEED_DEFAULT
     start_coroutine_tick(_drive_slide(WeakPointer(pc), state))
+    # The host is the only machine that can reach every client, so it is the one that announces the
+    # third-person pose - for its own slide and for every remote shadow it drives here. Clients skip
+    # it; the host will broadcast for a client's slide when it opens the matching shadow.
+    if not is_client():
+        try:
+            net_slide_pose(player, on=True)
+        except Exception as ex:  # noqa: BLE001 - a failed pose broadcast must never stop the slide
+            log.warning(f"POSE ON SEND FAILED {type(ex).__name__}: {ex}")
     log.info(f"begin_slide exit result=True player={player} live_slides={len(SLIDE_STATES)}")
     return True
 
@@ -495,6 +513,28 @@ def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
     log.info("server_set_slide_jump_velocity exit reason=velocity_written")
 
 
+@broadcast.json_message
+def net_slide_pose(player: int, on: bool) -> None:
+    """Play or clear the third-person slide pose for a player, on every machine.
+
+    Runs on: ALL players. `broadcast` runs this on the host and every client, so a single call leans
+    (or un-leans) that player's body on every screen. The host is the only one that calls it - only
+    the server can address all clients - and it does so for every slide it drives, its own and every
+    remote shadow alike (see `begin_slide` / `_end_slide`).
+
+    Presentation only: it resolves the player's local pawn and fires the pose event; `pose` does the
+    animating, `viewmodel` stays the first-person path. Keyed by PlayerID because a pawn object is not
+    shared across machines but the id is.
+    """
+    log.info(f"net_slide_pose enter player={player} on={on}")
+    pawn = pawn_for_player_id(player)
+    if pawn is None:
+        log.info(f"net_slide_pose exit reason=no_pawn player={player}")
+        return
+    events.fire(events.pose_started if on else events.pose_ended, pawn)
+    log.info("net_slide_pose exit")
+
+
 # Passed explicitly to add_network_functions: it only scans the scope of the module that calls it,
 # which is __init__, so nothing here would be picked up automatically.
 network_functions = [
@@ -502,6 +542,7 @@ network_functions = [
     server_enter_slide,
     server_exit_slide,
     server_set_slide_jump_velocity,
+    net_slide_pose,
 ]
 
 # Pinned rather than left to the library default of "<module>:<qualname>", which begins with the
