@@ -12,6 +12,7 @@ dependencies = [
     "uemath >= 1.0",
     "coroutines >= 1.0",
     "tweens >= 1.0",
+    "networking >= 1.2",
 ]
 
 
