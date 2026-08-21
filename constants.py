@@ -25,6 +25,15 @@ SLIDE_STEER_DEADZONE: float = 0.1
 """Sideways input weaker than this does not steer at all. Without it, input that is very nearly
 straight backwards leaves a sliver of a sideways component that still creeps the heading round."""
 
+HOST_ARM_GRACE: float = 0.25
+"""Seconds the host holds a just-opened shadow slide open before enforcing the crouch/ground gate.
+The `server_enter_slide` RPC that starts the shadow travels a faster channel than the replicated
+`bDuck` flag and beats it to the host, so the first driver tick reads `bDuck` false purely because
+the crouch state has not arrived yet - not because the player let go. Ending the slide there kills
+the shadow before `apply_remote_cap` ever lifts the cap. This window keeps it alive until the flag
+lands; the decay curve and duration cap still bound a shadow whose flag never arrives, and it is far
+shorter than a real slide (an exit RPC ends one early regardless)."""
+
 POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds.
 Every per-frame `every_n` gate throughout the mod uses this so a scan of the log stays aligned across

@@ -83,6 +83,12 @@ class PlayerSlideState:
     # MoveAutonomous hook (remote pawn on the host) read it and stamp it onto the pawn so the engine's
     # own movement drives the slide at slide speed on both machines.
     cap: float = 0.0
+    # Whether the owning machine's crouch flag (`bDuck`) has been seen true for this slide yet. The
+    # host opens its shadow from the enter RPC, which outruns the replicated `bDuck`, so the gate in
+    # `can_slide` must not end the slide on a not-yet-arrived flag. Latched true on the first ducking
+    # frame - immediate on the owning machine, where the local press sets `bDuck` the same frame -
+    # after which releasing crouch ends the slide as normal. Reset per slide in begin_slide_state.
+    armed: bool = False
 
 
 SLIDE_STATES: dict[int, PlayerSlideState] = {}
@@ -276,6 +282,9 @@ def begin_slide_state(
     # Open the cap at the curve's top so the very first frame - before the driver recomputes it - is
     # already clear of a clamp rather than zero (which would freeze the pawn for one frame).
     slide_data.cap = SLIDE_SPEED_DEFAULT
+    # Disarmed until this machine sees the crouch flag: on the host that is a few frames after the
+    # enter RPC opens the shadow, on the owning machine it is the first frame.
+    slide_data.armed = False
     log.info(
         f"begin_slide_state exit speed_pct={slide_data.speed_pct:.3f}"
         f" entry=({slide_data.entry_x:.3f},{slide_data.entry_y:.3f})"

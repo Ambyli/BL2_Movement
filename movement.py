@@ -18,6 +18,7 @@ from uemath import Vector
 
 from .constants import (
     CROUCHED_PCT_DEFAULT,
+    HOST_ARM_GRACE,
     POST_LOG_EVERY,
     SLIDE_BACK_CUTOFF,
     SLIDE_SPEED_DEFAULT,
@@ -38,15 +39,36 @@ def can_slide(
     """Whether this slide should still be running.
 
     Runs on: BOTH. `bDuck` reaches the host for a remote player through the move stream's compressed
-    flags, so the same gate reads true on both machines.
+    flags - but the `server_enter_slide` RPC that opens the host's shadow travels a separate, faster
+    channel and routinely beats that flag there. So on the host's first driver tick `bDuck` can read
+    false purely because the crouch state has not replicated yet, not because the player let go.
+    Ending the slide on that reading kills the shadow before `apply_remote_cap` ever lifts the cap,
+    and the remote player is re-simulated at stock crouch speed for the whole slide.
+
+    The arming latch bridges that race: until `bDuck` has been seen true once (`armed`), a false
+    reading inside the `HOST_ARM_GRACE` window means "not replicated yet" and holds the slide open so
+    the cap-lift survives. Once armed - immediate on the owning machine, where the local press sets
+    `bDuck` the same frame - the normal gate applies and releasing crouch ends the slide. `slide`'s
+    decay and duration cap still bound a shadow whose flag never arrives.
     """
     verbose = every_n("can_slide", POST_LOG_EVERY)
+    ducking = bool(pc.bDuck)
+    grounded = pawn.IsOnGroundOrShortFall()
+    if ducking:
+        slide_data.armed = True
     if verbose:
         log.debug(
-            f"can_slide enter is_sliding={slide_data.is_sliding} bDuck={bool(pc.bDuck)}"
-            f" on_ground={pawn.IsOnGroundOrShortFall()}",
+            f"can_slide enter is_sliding={slide_data.is_sliding} bDuck={ducking}"
+            f" on_ground={grounded} armed={slide_data.armed} elapsed={slide_data.elapsed:.3f}",
         )
-    result = slide_data.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
+    if not slide_data.is_sliding:
+        result = False
+    elif not slide_data.armed and slide_data.elapsed < HOST_ARM_GRACE:
+        # Shadow opened by the enter RPC but the crouch flag has not landed yet: hold it open rather
+        # than tearing down on frame one, so the cap-lift is in place when the flag arrives.
+        result = True
+    else:
+        result = ducking and grounded
     if verbose:
         log.debug(f"can_slide exit result={result}")
     return result
