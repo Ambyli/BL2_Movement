@@ -46,10 +46,15 @@ SLIDE_ANIM_RATE: float = 0.0
 """Skeletal-animation rate scale held on the body while sliding. 0 freezes the walk/crouch shuffle so
 the legs stop cycling under the lean; restored to the engine default (1.0) when the slide ends."""
 
-SLIDE_STEP_INTERVAL: float = 0.2
-"""Seconds between the footstep sounds a slide scuffs out through BL2's own `PlayFootStepSound` (which
-resolves the surface material itself). Lower = busier/faster scuff. A presentation tuning value; may
+SLIDE_STEP_INTERVAL: float = 0.1
+"""Seconds between the footstep bursts a slide scuffs out through BL2's own `PlayFootStepSound` (which
+resolves the surface material itself). Lower = tighter/busier scuff. A presentation tuning value; may
 become a mod-menu slider."""
+
+SLIDE_STEP_STACK: int = 2
+"""How many footstep sounds to stack per burst. `PlayFootStepSound` takes no volume (it posts a Wwise
+event), so stacking overlapping instances is the lever for making the slide louder. 1 = single,
+2+ = louder/denser."""
 
 POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds.

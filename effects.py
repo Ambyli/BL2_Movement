@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from coroutines import Time, WaitWhile, start_coroutine_tick
 from unrealsdk.unreal import WeakPointer
 
-from .constants import SLIDE_STEP_INTERVAL
+from .constants import SLIDE_STEP_INTERVAL, SLIDE_STEP_STACK
 from .debug import log
 
 if TYPE_CHECKING:
@@ -57,13 +57,15 @@ def _step_loop(key: int, ref: WeakPointer) -> TickCoroutine:
         pawn = ref()
         if pawn is None:
             break
-        try:
-            # bFirstPerson=False: the positional world footstep, so every player hears the slide at
-            # the pawn. BL2 resolves the surface material inside this call.
-            pawn.PlayFootStepSound(foot, False)
-        except Exception as ex:  # noqa: BLE001 - a failed sound must never break the cadence
-            log.warning(f"effects PlayFootStepSound failed {type(ex).__name__}: {ex}")
-        foot ^= 1  # alternate feet for a little variety
+        # Stack several footsteps per burst to make the slide louder (no volume control on the call),
+        # alternating feet. bFirstPerson=False is the positional world footstep, so every player hears
+        # the slide at the pawn. BL2 resolves the surface material inside the call.
+        for _ in range(SLIDE_STEP_STACK):
+            try:
+                pawn.PlayFootStepSound(foot, False)
+            except Exception as ex:  # noqa: BLE001 - a failed sound must never break the cadence
+                log.warning(f"effects PlayFootStepSound failed {type(ex).__name__}: {ex}")
+            foot ^= 1
         yield _wait(SLIDE_STEP_INTERVAL)
     _active.pop(key, None)
     log.info(f"effects._step_loop exit key={key}")
