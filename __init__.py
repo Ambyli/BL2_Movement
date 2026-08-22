@@ -10,7 +10,7 @@ from __future__ import annotations
 from mods_base import CoopSupport, build_mod
 from networking import add_network_functions
 
-from . import events, pose, viewmodel
+from . import effects, events, pose, viewmodel
 from .config import all_options
 from .debug import log
 from .hooks import all_hooks
@@ -23,6 +23,8 @@ events.slide_started.append(viewmodel.on_start)
 events.slide_ended.append(viewmodel.on_end)
 events.pose_started.append(pose.on_pose_start)
 events.pose_ended.append(pose.on_pose_end)
+events.pose_started.append(effects.on_start)
+events.pose_ended.append(effects.on_end)
 
 
 def _on_enable() -> None:

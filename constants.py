@@ -46,6 +46,11 @@ SLIDE_ANIM_RATE: float = 0.0
 """Skeletal-animation rate scale held on the body while sliding. 0 freezes the walk/crouch shuffle so
 the legs stop cycling under the lean; restored to the engine default (1.0) when the slide ends."""
 
+SLIDE_STEP_INTERVAL: float = 0.2
+"""Seconds between the footstep sounds a slide scuffs out through BL2's own `PlayFootStepSound` (which
+resolves the surface material itself). Lower = busier/faster scuff. A presentation tuning value; may
+become a mod-menu slider."""
+
 POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds.
 Every per-frame `every_n` gate throughout the mod uses this so a scan of the log stays aligned across
