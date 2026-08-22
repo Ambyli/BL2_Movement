@@ -15,3 +15,7 @@ env/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local-only working dirs: throwaway in-game probes and the planning docs
+spikes/
+docs/

@@ -34,10 +34,9 @@ the shadow before `apply_remote_cap` ever lifts the cap. This window keeps it al
 lands; the decay curve and duration cap still bound a shadow whose flag never arrives, and it is far
 shorter than a real slide (an exit RPC ends one early regardless)."""
 
-SLIDE_LEAN_PITCH: int = 10000
+SLIDE_LEAN_PITCH: int = 12000
 """Backward recline of the third-person body while sliding, in Unreal rotation units (65536 = 360
-degrees). Positive pitches the torso back into the slide; 10000 is ~55 degrees, confirmed in game. A
-presentation value rather than a physics one - it may move to a mod-menu slider later."""
+degrees). Positive pitches the whole body back into the slide; 12000 is ~66 degrees."""
 
 SLIDE_LEAN_ROLL: int = 0
 """Sideways tilt of the third-person body while sliding, in Unreal rotation units. 0 keeps the lean a
