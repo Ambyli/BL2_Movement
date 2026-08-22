@@ -19,16 +19,11 @@ from typing import TYPE_CHECKING
 
 from tweens import Tween, cubic_in_out, cubic_out
 
+from .constants import SLIDE_ANIM_RATE, SLIDE_LEAN_PITCH, SLIDE_LEAN_ROLL
 from .debug import log
 
 if TYPE_CHECKING:
     from common import WillowPlayerPawn
-
-# The slide lean, in Unreal rotation units (65536 == 360 degrees). Roll tips the body sideways into
-# the slide; Pitch leans it back a touch. Starting values - tune in game, then promote to constants
-# or mod-menu sliders once the look is settled.
-_LEAN_ROLL: int = 6000
-_LEAN_PITCH: int = -1500
 
 _tweens: dict[int, Tween] = {}
 """One tween per sliding pawn, keyed by PlayerID.
@@ -68,15 +63,20 @@ def on_pose_start(pawn: WillowPlayerPawn) -> None:
     # two interpolators fight over the same Rotation channels.
     _kill(key)
     tween = Tween()
-    tween.tween_property(mesh.Rotation, "Roll", final_value=_LEAN_ROLL, duration=0.25).from_current().transition(
+    tween.tween_property(mesh.Rotation, "Roll", final_value=SLIDE_LEAN_ROLL, duration=0.25).from_current().transition(
         cubic_out,
     )
-    tween.tween_property(mesh.Rotation, "Pitch", final_value=_LEAN_PITCH, duration=0.25).from_current().transition(
+    tween.tween_property(mesh.Rotation, "Pitch", final_value=SLIDE_LEAN_PITCH, duration=0.25).from_current().transition(
         cubic_out,
     )
     tween.set_parallel(True)
     tween.start()
     _tweens[key] = tween
+    # Freeze the engine's skeletal animation so the legs stop the crouch-walk shuffle while sliding.
+    # The lean above is a Python tween on the component transform, not engine anim, so it still plays.
+    # Restored in on_pose_end. Note this only *stops* the legs in their entry pose - it does not splay
+    # them into a slide; a real legs-out pose needs an animation BL2 does not have (see the plan doc).
+    mesh.GlobalAnimRateScale = SLIDE_ANIM_RATE
     log.info("pose.on_pose_start exit reason=leaning")
 
 
@@ -94,6 +94,8 @@ def on_pose_end(pawn: WillowPlayerPawn) -> None:
         _kill(key)
         log.info("pose.on_pose_end exit reason=no_mesh")
         return
+    # Un-freeze the skeletal animation (1.0 is the engine default) so the legs move normally again.
+    mesh.GlobalAnimRateScale = 1.0
     _kill(key)
     tween = Tween()
     tween.tween_property(mesh.Rotation, "Roll", final_value=0, duration=0.3).from_current().transition(

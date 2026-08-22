@@ -34,6 +34,19 @@ the shadow before `apply_remote_cap` ever lifts the cap. This window keeps it al
 lands; the decay curve and duration cap still bound a shadow whose flag never arrives, and it is far
 shorter than a real slide (an exit RPC ends one early regardless)."""
 
+SLIDE_LEAN_PITCH: int = 10000
+"""Backward recline of the third-person body while sliding, in Unreal rotation units (65536 = 360
+degrees). Positive pitches the torso back into the slide; 10000 is ~55 degrees, confirmed in game. A
+presentation value rather than a physics one - it may move to a mod-menu slider later."""
+
+SLIDE_LEAN_ROLL: int = 0
+"""Sideways tilt of the third-person body while sliding, in Unreal rotation units. 0 keeps the lean a
+pure backward recline; a small roll would angle the body into the turn."""
+
+SLIDE_ANIM_RATE: float = 0.0
+"""Skeletal-animation rate scale held on the body while sliding. 0 freezes the walk/crouch shuffle so
+the legs stop cycling under the lean; restored to the engine default (1.0) when the slide ends."""
+
 POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds.
 Every per-frame `every_n` gate throughout the mod uses this so a scan of the log stays aligned across
