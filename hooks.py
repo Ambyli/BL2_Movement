@@ -16,7 +16,7 @@ from coroutines import Time
 from uemath import Vector
 from unrealsdk import unreal
 
-from .constants import POST_LOG_EVERY
+from .constants import POST_LOG_EVERY, SLIDE_MIN_SPEED_FRACTION
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
 from .movement import steer_heading
@@ -102,6 +102,22 @@ def handle_move(
     )
 
 
+def _at_slide_speed(pawn: WillowPlayerPawn) -> bool:
+    """Whether the pawn is moving fast enough (near max sprint speed) to open a slide.
+
+    A slide should only come off a committed sprint, not a walk or a sprint that has not yet reached
+    top speed. While sprinting, `GroundSpeed` already reads as the sprint speed on this build
+    (class-mod adjustments included) - confirmed from the entry logs - so the gate is
+    `SLIDE_MIN_SPEED_FRACTION` of it.
+    """
+    speed = math.hypot(pawn.Velocity.X, pawn.Velocity.Y)
+    sprint_speed = float(pawn.GroundSpeed)
+    threshold = SLIDE_MIN_SPEED_FRACTION * sprint_speed
+    ok = speed >= threshold
+    log.info(f"_at_slide_speed speed={speed:.0f} sprint_speed={sprint_speed:.0f} threshold={threshold:.0f} ok={ok}")
+    return ok
+
+
 @hook("WillowGame.WillowPlayerInput:DuckPressed")
 def handle_duck(
     obj: unreal.UObject,
@@ -109,15 +125,18 @@ def handle_duck(
     _ret: Any,
     _func: unreal.BoundFunction,
 ) -> None:
-    """Crouching while sprinting starts a slide.
+    """Crouching while sprinting at speed starts a slide.
 
     Runs on: whichever machine's local player pressed duck.
     """
     # DuckPressed's `obj` is the WillowPlayerInput, whose Outer is the controller the rest of the
     # mod works with.
     pc = cast("WillowPlayerController", obj.Outer)
-    log.info(f"handle_duck enter sprinting={bool(pc.bInSprintState)}")
-    if pc.bInSprintState:
+    pawn = cast("WillowPlayerPawn", pc.Pawn)
+    sprinting = bool(pc.bInSprintState)
+    fast_enough = pawn is not None and _at_slide_speed(pawn)
+    log.info(f"handle_duck enter sprinting={sprinting} fast_enough={fast_enough}")
+    if sprinting and fast_enough:
         # enter_slide starts a driver and sends a message; a raise from either would leave state
         # half-populated. Log and continue so one bad slide cannot wedge every later one.
         try:

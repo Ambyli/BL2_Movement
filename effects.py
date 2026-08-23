@@ -1,9 +1,9 @@
 """Slide effects, assembled from a phase "recipe": an entry hit, then an ongoing sound and dust trail.
 
-Each effect is a small callable that plays one instance on a pawn; the factories below - `footstep_sound`,
-`akevent`, `impact`, `particle` - build them, each wrapping the one engine call it needs. A `Recipe`
-just wires which effect fires when, so the loop is mechanism-agnostic: swapping a slide's sound or dust
-is a one-line change in `CURRENT`, not a change to the driver.
+Each effect is a small callable that plays one instance on a pawn; the factories below - `akevent`,
+`impact`, `particle` - build them, each wrapping the one engine call it needs. A `Recipe` just wires
+which effect fires when, so the loop is mechanism-agnostic: swapping a slide's sound or dust is a
+one-line change in `CURRENT`, not a change to the driver.
 
 Driven by the pose events, which fire on every machine for every sliding pawn (see
 `lifecycle.net_slide_pose`), so each machine plays its own copy positioned at the pawn - the effects
@@ -24,7 +24,7 @@ from mods_base import ENGINE
 from unrealsdk import find_object, make_struct
 from unrealsdk.unreal import WeakPointer
 
-from .constants import SLIDE_DUST_FOOT_DROP, SLIDE_DUST_FORWARD, SLIDE_FX_TICK
+from .constants import SLIDE_DUST_DROP, SLIDE_DUST_FORWARD, SLIDE_FX_TICK
 from .debug import log
 
 if TYPE_CHECKING:
@@ -48,7 +48,9 @@ def _resolve(cls_name: str, path: str) -> object | None:
     try:
         obj = find_object(cls_name, path)
     except Exception as ex:  # noqa: BLE001 - a missing asset is not fatal, just no effect
-        log.warning(f"effects asset not found {cls_name} {path}: {type(ex).__name__}: {ex}")
+        log.warning(
+            f"effects asset not found {cls_name} {path}: {type(ex).__name__}: {ex}"
+        )
         return None
     if obj is not None:
         _objects[path] = obj
@@ -64,18 +66,6 @@ def _emitter_pool() -> object | None:
 
 
 # --- effect factories: each returns a callable that plays one instance on a pawn --------------------
-
-
-def footstep_sound() -> Effect:
-    """The engine's built-in footstep sound, which resolves the surface material itself."""
-
-    def play(pawn: WillowPlayerPawn) -> None:
-        try:
-            pawn.PlayFootStepSound(1, False)
-        except Exception as ex:  # noqa: BLE001 - a failed effect must never break the slide
-            log.warning(f"effects footstep_sound failed {type(ex).__name__}: {ex}")
-
-    return play
 
 
 def akevent(path: str) -> Effect:
@@ -135,7 +125,7 @@ def particle(path: str) -> Effect:
             "Vector",
             X=origin.X + fwd_x * SLIDE_DUST_FORWARD,
             Y=origin.Y + fwd_y * SLIDE_DUST_FORWARD,
-            Z=origin.Z - SLIDE_DUST_FOOT_DROP,
+            Z=origin.Z - SLIDE_DUST_DROP,
         )
         try:
             pool.SpawnEmitter(template, where)
@@ -211,7 +201,10 @@ def _effects_loop(key: int, ref: WeakPointer) -> TickCoroutine:
             CURRENT.loop_dust(pawn)
             since_dust = 0.0
 
-        if CURRENT.loop_sound is not None and since_sound >= CURRENT.loop_sound_interval:
+        if (
+            CURRENT.loop_sound is not None
+            and since_sound >= CURRENT.loop_sound_interval
+        ):
             CURRENT.loop_sound(pawn)
             since_sound = 0.0
 
@@ -225,7 +218,9 @@ def on_start(pawn: WillowPlayerPawn) -> None:
     key = _key(pawn)
     log.info(f"effects.on_start enter key={key}")
     if key is None or key in _active:
-        log.info(f"effects.on_start exit reason={'no_player_id' if key is None else 'already_running'}")
+        log.info(
+            f"effects.on_start exit reason={'no_player_id' if key is None else 'already_running'}"
+        )
         return
     if CURRENT.enter is not None:
         CURRENT.enter(pawn)
