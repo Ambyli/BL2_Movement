@@ -5,16 +5,15 @@ restart - recompiling this mod means quitting to desktop and reloading a save, w
 slowest part of working on it. Read these as `option.value` at the point of use; never cache them,
 or a change silently stops taking effect.
 
-Two control kinds: a `SliderOption` where a real number matters (speed, turn angle, sound stack), and
-a `Preset` - a `SpinnerOption` of named choices mapped to values - where fiddling a decimal on a bar
-is just annoying. A `Preset` still reads as `.value` (the mapped number), so nothing downstream cares
-which kind a dial is.
+Two control kinds: a `SliderOption` where a real number matters (speed, turn angle), and a `Preset` -
+a `SpinnerOption` of named choices mapped to values - where fiddling a decimal on a bar is just
+annoying. A `Preset` still reads as `.value` (the mapped number), so nothing downstream cares which
+kind a dial is.
 
-Each physics dial fires `_on_slider_change` when the user changes it in the mod menu; that callback
+Each dial fires `_on_slider_change` when the user changes it in the mod menu; that callback
 re-announces the full set to the host so a remote player's slide runs with their own tuned values
 rather than the host's defaults. The announce is idempotent and best-effort - a raise from the RPC
-path is swallowed rather than leaked back into the mod menu. The sound dials are local presentation
-and skip the announce.
+path is swallowed rather than leaked back into the mod menu.
 """
 
 from __future__ import annotations
@@ -104,7 +103,7 @@ start_speed = SliderOption(
 decay_rate = Preset(
     "Slide Length",
     {"Very short": 2.4, "Short": 1.7, "Normal": 1.15, "Long": 0.8, "Very long": 0.5},
-    "Normal",
+    "Short",
     "How far a slide carries before it runs out. Longer slides bleed their speed off more slowly.",
     on_change=_on_slider_change,
 )
@@ -155,28 +154,6 @@ uphill_drag = Preset(
     on_change=_on_slider_change,
 )
 
-# --- sound dials (local presentation, read live, no announce) --------------------------------------
-
-step_interval = Preset(
-    "Slide Sound Density",
-    {"Sparse": 0.2, "Normal": 0.1, "Tight": 0.07, "Very tight": 0.05},
-    "Normal",
-    "How closely the slide's scuff sounds repeat. Tighter is a busier scuff.",
-)
-
-step_stack = SliderOption(
-    "Slide Sound Volume",
-    2,
-    1,
-    5,
-    1,
-    is_integer=True,
-    description=(
-        "How many footstep sounds stack per burst. The footstep call has no volume control, so more"
-        " stacked instances make the slide louder."
-    ),
-)
-
 all_options = [
     GroupedOption(
         "Sliding",
@@ -188,13 +165,6 @@ all_options = [
             max_turn_degrees,
             downhill_boost.option,
             uphill_drag.option,
-        ),
-    ),
-    GroupedOption(
-        "Slide Effects",
-        (
-            step_interval.option,
-            step_stack,
         ),
     ),
 ]
