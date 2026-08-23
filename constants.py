@@ -34,6 +34,37 @@ the shadow before `apply_remote_cap` ever lifts the cap. This window keeps it al
 lands; the decay curve and duration cap still bound a shadow whose flag never arrives, and it is far
 shorter than a real slide (an exit RPC ends one early regardless)."""
 
+SLIDE_LEAN_PITCH: int = 12000
+"""Backward recline of the third-person body while sliding, in Unreal rotation units (65536 = 360
+degrees). Positive pitches the whole body back into the slide; 12000 is ~66 degrees."""
+
+SLIDE_LEAN_ROLL: int = 0
+"""Sideways tilt of the third-person body while sliding, in Unreal rotation units. 0 keeps the lean a
+pure backward recline; a small roll would angle the body into the turn."""
+
+SLIDE_ANIM_RATE: float = 0.0
+"""Skeletal-animation rate scale held on the body while sliding. 0 freezes the walk/crouch shuffle so
+the legs stop cycling under the lean; restored to the engine default (1.0) when the slide ends."""
+
+SLIDE_MIN_SPEED_FRACTION: float = 0.9
+"""Fraction of max sprint speed the player must be moving at (horizontally) before a slide will start,
+so a slide only comes off a committed sprint, not a walk or a sprint still winding up. While sprinting
+the pawn's `GroundSpeed` already reads as its (class-mod-adjusted) sprint speed, so that is the
+reference. 0 disables the speed gate. Enforced in the duck hook."""
+
+SLIDE_DUST_DROP: float = 78.0
+"""How far below the pawn's Location (capsule centre) to spawn the slide dust, in unreal units - about
+foot height, so the dust kicks up from the surface rather than the pawn's waist. The player capsule
+half-height is ~80."""
+
+SLIDE_DUST_FORWARD: float = 40.0
+"""How far ahead of the pawn (along its travel direction) to spawn the slide dust, in unreal units, so
+it kicks up just in front rather than under the body."""
+
+SLIDE_FX_TICK: float = 0.03
+"""Base tick of the slide-effects loop, in seconds. Fine enough that the dust and the sound can each
+be paced off their own interval; not a per-effect rate itself."""
+
 POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds.
 Every per-frame `every_n` gate throughout the mod uses this so a scan of the log stays aligned across
