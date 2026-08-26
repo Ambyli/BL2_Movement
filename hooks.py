@@ -42,7 +42,14 @@ def jump(
     if OWN_SLIDE_STATE.is_sliding:
         # Snapshot before the engine's Jump processing changes it.
         pc = cast("WillowPlayerController", obj.Outer)
-        vel: Vector = Vector(pc.Pawn.Velocity)
+        pawn = cast("WillowPlayerPawn", getattr(pc, "Pawn", None))
+        if pawn is None:
+            # Pawn torn down (death, respawn, level change) on the same frame a slide-jump fired.
+            # Reading Velocity off a null pawn would dereference freed memory in the SDK; drop the
+            # handoff instead. Every other pawn access in this module guards this the same way.
+            log.info("jump exit reason=no_pawn")
+            return
+        vel: Vector = Vector(pawn.Velocity)
         vel.z = 0
         State.horizontal_velocity = vel
         State.do_slide_jump = True
