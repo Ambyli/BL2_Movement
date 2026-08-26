@@ -35,16 +35,29 @@ if TYPE_CHECKING:
 
     Effect = Callable[[WillowPlayerPawn], None]
 
-_objects: dict[str, object] = {}
-"""Cache of resolved game objects (impact defs, AkEvents, particle systems) by object path. Only
-successful lookups are cached, so an asset not loaded yet is retried rather than stuck at None."""
+_objects: dict[str, WeakPointer] = {}
+"""Weak cache of resolved game assets (impact defs, AkEvents, particle systems) by object path.
+
+Weak on purpose. BL2 streams these assets in and out - a sublevel unloading garbage-collects its
+particle systems, impacts and sounds - so a strong cache would dangle: firing an effect with a freed
+asset pointer crashes pyunrealsdk while it marshals the engine call (a read of freed memory), or, once
+the slot has been reused, raises "Object is not instance of ...". A weak pointer never hands back freed
+memory - it resolves to None once the asset is gone - so we re-resolve then, and only cache live
+lookups (an asset not loaded yet is retried rather than stuck at None)."""
 
 
 def _resolve(cls_name: str, path: str) -> object | None:
-    """Resolve (and cache) a game object by class + object path, or None if it is not loaded."""
-    cached = _objects.get(path)
-    if cached is not None:
-        return cached
+    """Resolve (and weakly cache) a game asset by class + object path, or None if it is not loaded.
+
+    Re-resolves when the cached asset has been streamed out since, so the returned object is always
+    live - never a dangling pointer that would fault pyunrealsdk when passed to an effect's engine call.
+    """
+    ref = _objects.get(path)
+    if ref is not None:
+        cached = ref()
+        if cached is not None:
+            return cached
+        # The asset was streamed out since we cached it; fall through and re-resolve a live one.
     try:
         obj = find_object(cls_name, path)
     except Exception as ex:  # noqa: BLE001 - a missing asset is not fatal, just no effect
@@ -53,7 +66,7 @@ def _resolve(cls_name: str, path: str) -> object | None:
         )
         return None
     if obj is not None:
-        _objects[path] = obj
+        _objects[path] = WeakPointer(obj)
     return obj
 
 
