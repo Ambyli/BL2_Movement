@@ -15,11 +15,12 @@ Runs on: BOTH (every machine), once per slide per machine, for whichever pawn th
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from tweens import Tween, cubic_in_out, cubic_out
 from unrealsdk.unreal import WeakPointer
 
+from .anim import SAFE_PAUSE, field_sink
 from .constants import SLIDE_ANIM_RATE, SLIDE_LEAN_PITCH, SLIDE_LEAN_ROLL
 from .debug import log
 
@@ -51,41 +52,18 @@ def _kill(key: int) -> None:
         tween.kill()
 
 
-def _rotation_sink(ref: WeakPointer, field: str) -> Callable[[float], None]:
-    """A tween sink that writes one field (Roll/Pitch) of the pawn's mesh Rotation each frame.
+def _body_mesh(pawn: WillowPlayerPawn) -> Any:
+    """The body's skeletal mesh from a live pawn, or None if it (or the pawn) is gone.
 
-    This is the crash fix. The old code handed the tween `mesh.Rotation` directly - a struct view
-    backed by the component's native memory - and the tween then wrote into that captured view every
-    frame for the whole 0.25-0.3s lean. A pawn destroyed mid-lean (death, respawn, level change, or a
-    remote proxy leaving relevance in co-op) freed that memory while the tween kept writing to it: an
-    access violation in the SDK, on every machine, since the pose is broadcast.
-
-    So the tween never holds the struct now. This sink re-resolves the pawn from a weak pointer every
-    frame and does nothing once it is gone, then reads a fresh Rotation off a still-live mesh for each
-    write. Same weak-pointer re-resolve `_drive_slide` and the effects loop already use for their own
-    per-frame pawn access.
+    The sinks call this every frame off a weak pointer, so it must tolerate the pawn having been torn
+    down since the tween started. Mirrors `viewmodel._arms_mesh`.
     """
-
-    def sink(value: float) -> None:
-        pawn = ref()
-        if pawn is None:
-            return
-        mesh = getattr(pawn, "Mesh", None)
-        if mesh is None:
-            return
-        rotation = mesh.Rotation
-        setattr(rotation, field, int(value))
-        # Assign the whole struct back rather than trusting the read to be a live view - correct
-        # whether the SDK handed back a view or a copy, and the two parallel sinks each re-read first
-        # so they never clobber each other's field.
-        mesh.Rotation = rotation
-
-    return sink
+    return getattr(pawn, "Mesh", None)
 
 
 def _lean(
     pawn: WillowPlayerPawn,
-    mesh: object,
+    mesh: Any,
     key: int,
     roll: int,
     pitch: int,
@@ -94,26 +72,30 @@ def _lean(
 ) -> None:
     """Start a parallel Roll+Pitch lean toward (roll, pitch) over `duration`, tracked under `key`.
 
-    Writes go through weak-pointer-guarded sinks (see `_rotation_sink`), so the tween is safe to
-    outlive the pawn. `mesh` is the caller's already-resolved, currently-live mesh, used only to read
-    the starting angles here and now; the tween itself never captures it.
+    Writes go through weak-pointer-guarded sinks (`anim.field_sink`), so the tween is safe to outlive
+    the pawn. `mesh` is the caller's already-resolved, currently-live mesh, used only to read the
+    starting angles here and now; the sinks re-resolve the live mesh every frame. Same helpers, and
+    same reasoning, as the arm tweens in `viewmodel`.
     """
     ref = WeakPointer(pawn)
     current = mesh.Rotation
     tween = Tween()
     tween.tween_callable(
-        _rotation_sink(ref, "Roll"),
+        field_sink(ref, _body_mesh, "Rotation", "Roll"),
         start_value=int(current.Roll),
         final_value=roll,
         duration=duration,
     ).transition(ease)
     tween.tween_callable(
-        _rotation_sink(ref, "Pitch"),
+        field_sink(ref, _body_mesh, "Rotation", "Pitch"),
         start_value=int(current.Pitch),
         final_value=pitch,
         duration=duration,
     ).transition(ease)
     tween.set_parallel(True)
+    # Guard the per-frame pause read so a lean still animating into a zone load does not fault on the
+    # tween library's default `get_pc().IsPaused()` gate (None mid-load). See `anim.SAFE_PAUSE`.
+    tween.pause_while(SAFE_PAUSE)
     tween.start()
     _tweens[key] = tween
 
