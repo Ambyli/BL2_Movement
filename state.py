@@ -13,7 +13,7 @@ from mods_base import ENGINE
 from uemath import Vector
 from unrealsdk import find_all, find_enum
 
-from .constants import SLIDE_SPEED_DEFAULT
+from .constants import PHYS_WALKING, SLIDE_SPEED_DEFAULT
 from .debug import log
 
 if TYPE_CHECKING:
@@ -203,6 +203,45 @@ def player_id(pc: WillowPlayerController) -> int | None:
     result = int(pri.PlayerID)
     log.debug(f"player_id exit result={result}")
     return result
+
+
+def on_ground(pawn: WillowPlayerPawn) -> bool:
+    """Whether the pawn is in walking physics - a UFunction-free stand-in for `IsOnGroundOrShortFall`.
+
+    This is the zone-load crash fix. Calling `pawn.IsOnGroundOrShortFall()` is a UFunction: the engine
+    dispatches it through the pawn's native movement code. During a level transition the pawn is
+    teleported to a limbo position and its native physics is torn down while the Python-visible object
+    still resolves and still reads fine - so the *method call* dereferences a freed pointer and
+    hard-crashes the game (confirmed from the crash minidump: an execute-at-0 access violation reached
+    straight from the slide driver's per-frame gate, same signature every time). A plain `Physics`
+    byte read touches only the object's own memory and is safe on a transitioning pawn, exactly as the
+    driver's other per-frame reads already are (`Location`, `Velocity`, `GroundSpeed`).
+
+    The tradeoff is the lost "short fall" tolerance: `IsOnGroundOrShortFall` also returns true for a
+    brief drop within a short distance of the ground, so a slide over a small ledge or crest used to
+    survive where this ends it the moment the pawn enters `PHYS_Falling`. Cheap next to crashing the
+    game; revisit the gate if slides feel like they clip short on rough terrain.
+    """
+    return int(getattr(pawn, "Physics", 0)) == PHYS_WALKING
+
+
+def pawn_deleting(pawn: WillowPlayerPawn) -> bool:
+    """Whether the engine has begun destroying this pawn (level change, death, disconnect).
+
+    This is the zone-load crash guard. A level transition keeps the player *controller* alive while
+    replacing its pawn, so `WeakPointer(pc)` still resolves and `pc.Pawn` briefly hands back the
+    outgoing pawn - an object that still reads fine but whose native physics/base has been torn down.
+    Calling ANY movement UFunction on it (`IsOnGroundOrShortFall`, `DoJump`) then dereferences a freed
+    pointer inside the engine and hard-crashes the process: an access violation executing address 0,
+    with no Python traceback (confirmed from the crash minidump - the fault is in the engine's own
+    UFunction body, reached from our per-frame gate).
+
+    `bDeleteMe` is set at the very start of the engine's actor-destroy path, *before* that physics
+    teardown, so it flags exactly this window. Reading it is a plain field read - safe on the still-live
+    UObject, and never a UFunction call - so gating every per-frame pawn UFunction on it closes the
+    hole. A fully-freed pawn never reaches here: its weak pointer resolves to None first.
+    """
+    return bool(getattr(pawn, "bDeleteMe", False)) or bool(getattr(pawn, "bPendingDelete", False))
 
 
 def pawn_for_player_id(player: int) -> WillowPlayerPawn | None:

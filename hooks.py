@@ -20,7 +20,7 @@ from .constants import POST_LOG_EVERY, SLIDE_MIN_SPEED_FRACTION
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
 from .movement import steer_heading
-from .state import OWN_SLIDE_STATE, State, is_client, player_id, state_for
+from .state import OWN_SLIDE_STATE, State, is_client, pawn_deleting, player_id, state_for
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -85,9 +85,10 @@ def handle_move(
 
     pc = cast("WillowPlayerController", obj)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
-    if pawn is None:
+    if pawn is None or pawn_deleting(pawn):
         # Respawn or level transition mid-jump. Drop the pending handoff rather than leaving it set
-        # for whatever pawn arrives next.
+        # for whatever pawn arrives next. A pawn being destroyed is treated as gone: calling
+        # IsOnGroundOrShortFall / DoJump on it would fault in the engine (see state.pawn_deleting).
         State.do_slide_jump = False
         log.info("handle_move exit reason=no_pawn dropped_handoff")
         return

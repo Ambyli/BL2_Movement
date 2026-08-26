@@ -69,3 +69,9 @@ POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds.
 Every per-frame `every_n` gate throughout the mod uses this so a scan of the log stays aligned across
 modules."""
+
+PHYS_WALKING: int = 1
+"""UE3 `EPhysics.PHYS_Walking`, the engine's ground-movement physics mode. Stable across every
+Borderlands build - the enum is engine-level. Read off `pawn.Physics` by `state.on_ground` as a
+UFunction-free stand-in for `IsOnGroundOrShortFall()`, whose method call faults on a pawn mid-level-
+transition (see `state.on_ground`)."""
