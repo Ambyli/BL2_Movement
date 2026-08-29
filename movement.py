@@ -26,7 +26,7 @@ from .constants import (
 )
 from .debug import every_n, log
 from .gating import optimistic
-from .state import PlayerSlideState
+from .state import PlayerSlideState, on_ground
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -47,11 +47,15 @@ def can_slide(
     flags, so the same gate reads true on both machines once that flag has landed.
     """
     verbose = every_n("can_slide", POST_LOG_EVERY)
-    result = slide_data.is_sliding and bool(pc.bDuck) and pawn.IsOnGroundOrShortFall()
+    # `on_ground` reads the pawn's Physics byte rather than calling IsOnGroundOrShortFall(): the
+    # method is a UFunction that faults on a pawn mid-level-transition, and this gate runs every frame.
+    # See state.on_ground.
+    grounded = on_ground(pawn)
+    result = slide_data.is_sliding and bool(pc.bDuck) and grounded
     if verbose:
         log.debug(
             f"can_slide is_sliding={slide_data.is_sliding} bDuck={bool(pc.bDuck)}"
-            f" on_ground={pawn.IsOnGroundOrShortFall()} result={result}",
+            f" on_ground={grounded} result={result}",
         )
     return result
 

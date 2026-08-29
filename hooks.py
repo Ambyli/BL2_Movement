@@ -20,7 +20,7 @@ from .constants import POST_LOG_EVERY, SLIDE_MIN_SPEED_FRACTION
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
 from .movement import steer_heading
-from .state import OWN_SLIDE_STATE, State, is_client, player_id, state_for
+from .state import OWN_SLIDE_STATE, State, is_client, on_ground, pawn_deleting, player_id, state_for
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -42,7 +42,14 @@ def jump(
     if OWN_SLIDE_STATE.is_sliding:
         # Snapshot before the engine's Jump processing changes it.
         pc = cast("WillowPlayerController", obj.Outer)
-        vel: Vector = Vector(pc.Pawn.Velocity)
+        pawn = cast("WillowPlayerPawn", getattr(pc, "Pawn", None))
+        if pawn is None:
+            # Pawn torn down (death, respawn, level change) on the same frame a slide-jump fired.
+            # Reading Velocity off a null pawn would dereference freed memory in the SDK; drop the
+            # handoff instead. Every other pawn access in this module guards this the same way.
+            log.info("jump exit reason=no_pawn")
+            return
+        vel: Vector = Vector(pawn.Velocity)
         vel.z = 0
         State.horizontal_velocity = vel
         State.do_slide_jump = True
@@ -78,9 +85,10 @@ def handle_move(
 
     pc = cast("WillowPlayerController", obj)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
-    if pawn is None:
+    if pawn is None or pawn_deleting(pawn):
         # Respawn or level transition mid-jump. Drop the pending handoff rather than leaving it set
-        # for whatever pawn arrives next.
+        # for whatever pawn arrives next. A pawn being destroyed is treated as gone: calling
+        # IsOnGroundOrShortFall / DoJump on it would fault in the engine (see state.pawn_deleting).
         State.do_slide_jump = False
         log.info("handle_move exit reason=no_pawn dropped_handoff")
         return
@@ -134,9 +142,13 @@ def handle_duck(
     pc = cast("WillowPlayerController", obj.Outer)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
     sprinting = bool(pc.bInSprintState)
+    # A slide must start from the ground - a sprint-jump keeps `bInSprintState` and full velocity in the
+    # air, so without this a mid-air crouch would open a slide. `on_ground` reads the Physics byte (safe
+    # to call every input; see state.on_ground) and matches the crouch/ground continue gate in can_slide.
+    grounded = pawn is not None and on_ground(pawn)
     fast_enough = pawn is not None and _at_slide_speed(pawn)
-    log.info(f"handle_duck enter sprinting={sprinting} fast_enough={fast_enough}")
-    if sprinting and fast_enough:
+    log.info(f"handle_duck enter sprinting={sprinting} grounded={grounded} fast_enough={fast_enough}")
+    if sprinting and grounded and fast_enough:
         # enter_slide starts a driver and sends a message; a raise from either would leave state
         # half-populated. Log and continue so one bad slide cannot wedge every later one.
         try:

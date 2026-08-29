@@ -19,3 +19,6 @@ Thumbs.db
 # Local-only working dirs: throwaway in-game probes and the planning docs
 spikes/
 docs/
+reference/
+tools/
+CLAUDE.md

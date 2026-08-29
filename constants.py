@@ -69,3 +69,59 @@ POST_LOG_EVERY: int = 30
 """One line per this many forced frames, so a slide costs a handful of lines rather than hundreds.
 Every per-frame `every_n` gate throughout the mod uses this so a scan of the log stays aligned across
 modules."""
+
+PHYS_WALKING: int = 1
+"""UE3 `EPhysics.PHYS_Walking`, the engine's ground-movement physics mode. Stable across every
+Borderlands build - the enum is engine-level. Read off `pawn.Physics` by `state.on_ground` as a
+UFunction-free stand-in for `IsOnGroundOrShortFall()`, whose method call faults on a pawn mid-level-
+transition (see `state.on_ground`)."""
+
+# --- HUD slide indicator (see hud.py) ---
+
+CROUCH_CLIP_PATH: str = "_level0.p1.crouch"
+"""ActionScript path of the native crouch indicator clip inside WillowHUDGFxMovie (a direct child of
+the player-1 HUD root `p1`, found via the gfx_enum probe). Hidden while sliding; the slide icon draws
+in its place."""
+
+CROUCH_SHOWN_FRAME: int = 6
+"""The crouch clip's "shown" timeline frame (frame 1 is blank). The game's `UpdateCrouched` sets this
+on a crouch transition; the "always show crouch icon" option forces it so the icon shows regardless of
+the player's crouch state."""
+
+HUD_STAGE_W: float = 1280.0
+"""Authored width of the WillowHUDGFxMovie stage. `scaleMode = exactFit` stretches the 1280x720 stage
+across the whole viewport, so a stage coordinate maps to a pixel by `screen = stage / STAGE * canvas`
+at any resolution (confirmed by the gfx_stage probe)."""
+
+HUD_STAGE_H: float = 720.0
+"""Authored height of the HUD stage. See `HUD_STAGE_W`."""
+
+SLIDE_ICON_FRAC_X: float = 570.3 / HUD_STAGE_W
+"""Fallback slide-icon X position as a fraction of the canvas, used when the crouch clip's live coords
+can't be read. The measured stage anchor (`p1` + `crouch` = 570.3) over the stage width."""
+
+SLIDE_ICON_FRAC_Y: float = 407.55 / HUD_STAGE_H
+"""Fallback slide-icon Y position as a fraction of the canvas. See `SLIDE_ICON_FRAC_X`."""
+
+SLIDE_ICON_SCALE: float = 1.0
+"""Draw scale as a multiple of the native crouch icon's on-screen height. 1.0 = the same size as the
+crouch icon it replaces; raise it to enlarge. The source is drawn well above this size (supersampled)
+and downsampled with clean mips, so it stays crisp - matching the crouch icon's density. The icon is
+centred on the crouch anchor regardless of scale."""
+
+SLIDE_ICON_PACKAGE: str = "sliding_slideicon"
+"""Name of the bundled BL2 package (built by tools/build_icon_upk.py) holding the slide-icon texture.
+Copied into CookedPCConsole on first use so the game finds it by this name."""
+
+SLIDE_ICON_OBJECT: str = "sliding_slideicon.SlideTex"
+"""Full object path of the slide-icon Texture2D inside `SLIDE_ICON_PACKAGE`."""
+
+BLEND_TRANSLUCENT: int = 2
+"""UE3 `EBlendMode.BLEND_Translucent`. Passed as `Canvas.DrawTile`'s `Blend` argument so the icon's
+per-pixel alpha is honoured (standard source-alpha blending). The default blend draws the tile opaque,
+filling the icon's transparent areas with its background - a solid box instead of a cut-out icon."""
+
+RF_STANDALONE: int = 0x4000
+"""UE3 `RF_Standalone` object flag ("keep even if unreferenced"). Native resident textures carry it
+(flags 0x...104018 vs a fresh 0x...100018); OR-ing it onto our loaded texture stops BL2's GC from
+collecting it, which would leave the draw hook dereferencing freed memory (a hard crash)."""

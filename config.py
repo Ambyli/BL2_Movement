@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mods_base import GroupedOption, SliderOption, SpinnerOption
+from mods_base import BoolOption, GroupedOption, SliderOption, SpinnerOption
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -154,6 +154,49 @@ uphill_drag = Preset(
     on_change=_on_slider_change,
 )
 
+# --- HUD dials (local display only; not announced to the host, so no _on_slider_change) ------------
+
+icon_offset_x = SliderOption(
+    "Slide Icon X Offset",
+    32.0,
+    -300.0,
+    300.0,
+    1.0,
+    is_integer=False,
+    description=(
+        "Horizontal position of the slide icon, in HUD stage units (resolution-independent). Increase"
+        " to move it right, decrease to move it left. Tuned to sit on the native crouch icon."
+    ),
+)
+
+icon_offset_y = SliderOption(
+    "Slide Icon Y Offset",
+    24.0,
+    -300.0,
+    300.0,
+    1.0,
+    is_integer=False,
+    description=(
+        "Vertical position of the slide icon, in HUD stage units (resolution-independent). Increase to"
+        " move it down, decrease to move it up."
+    ),
+)
+
+always_show_slide_icon = BoolOption(
+    "Always Show Slide Icon",
+    False,
+    description="Draw the slide icon at all times, not only while sliding - handy for positioning it.",
+)
+
+always_show_crouch_icon = BoolOption(
+    "Always Show Crouch Icon",
+    False,
+    description=(
+        "Keep the native crouch icon on screen regardless of the player's state, instead of hiding it"
+        " while sliding."
+    ),
+)
+
 all_options = [
     GroupedOption(
         "Sliding",
@@ -165,6 +208,15 @@ all_options = [
             max_turn_degrees,
             downhill_boost.option,
             uphill_drag.option,
+        ),
+    ),
+    GroupedOption(
+        "Slide HUD",
+        (
+            icon_offset_x,
+            icon_offset_y,
+            always_show_slide_icon,
+            always_show_crouch_icon,
         ),
     ),
 ]

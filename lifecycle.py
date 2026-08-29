@@ -37,6 +37,8 @@ from .state import (
     default_settings,
     heading_from,
     is_client,
+    on_ground,
+    pawn_deleting,
     pawn_for_player_id,
     player_id,
     state_for,
@@ -204,7 +206,7 @@ def _log_slide_snapshot(
         f" speed_forced={forced_speed:.0f} speed_actual={speed_actual:.0f}"
         f" pct={state.speed_pct:.3f}"
         f" elapsed={state.elapsed:.2f}/{state.max_duration:.2f} progress={progress * 100:.0f}%"
-        f" ground={pawn.IsOnGroundOrShortFall()} crouched_pct={pawn.CrouchedPct:.3f}"
+        f" ground={on_ground(pawn)} crouched_pct={pawn.CrouchedPct:.3f}"
         f" delta={delta_time:.4f}",
     )
 
@@ -228,11 +230,19 @@ def _drive_slide(
         verbose = every_n("_drive_slide", POST_LOG_EVERY)
         pc = pc_ref()
         pawn = None if pc is None else cast("WillowPlayerPawn", pc.Pawn)
-        if pc is None or pawn is None:
+        # `deleting`: the pawn object still resolves, but the engine has begun destroying it (a level
+        # change keeps the controller alive while swapping its pawn). Its native physics is already
+        # gone, so the gate's `IsOnGroundOrShortFall` below - or any other pawn UFunction - would fault
+        # inside the engine and hard-crash the game. Treat it exactly like a gone pawn, and hand
+        # `_end_slide` None so it makes no pawn call on the way out. See `state.pawn_deleting`.
+        deleting = pawn is not None and pawn_deleting(pawn)
+        if pc is None or pawn is None or deleting:
             # Death, disconnect or a level change. Nothing left to drive, and nothing to restore
-            # either - the pawn this state described no longer exists.
-            log.info(f"_drive_slide teardown reason=pc={pc is not None},pawn={pawn is not None}")
-            _end_slide(pc, pawn, state)
+            # either - the pawn this state described no longer exists (or is being destroyed).
+            log.info(
+                f"_drive_slide teardown reason=pc={pc is not None},pawn={pawn is not None},deleting={deleting}",
+            )
+            _end_slide(pc, None if deleting else pawn, state)
             log.info("_drive_slide exit reason=weakref_gone")
             return
 
@@ -496,7 +506,9 @@ def server_set_slide_jump_velocity(vel_x: float, vel_y: float) -> None:
     """
     log.info(f"server_set_slide_jump_velocity enter vel=({vel_x:.0f},{vel_y:.0f})")
     pc = cast("WillowPlayerController", server_set_slide_jump_velocity.sender.Owner)
-    if pc is None or (pawn := pc.Pawn) is None:
+    if pc is None or (pawn := pc.Pawn) is None or pawn_deleting(cast("WillowPlayerPawn", pawn)):
+        # A pawn mid-destruction (level change) resolves but its physics is gone; DoJump /
+        # IsOnGroundOrShortFall below would fault in the engine. See state.pawn_deleting.
         log.info(f"server_set_slide_jump_velocity exit reason=no_pawn has_pc={pc is not None}")
         return
     # If this arrived on the same frame the client's DoJump ran, the host's copy of the pawn is

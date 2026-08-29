@@ -15,14 +15,18 @@ Runs on: BOTH (every machine), once per slide per machine, for whichever pawn th
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from tweens import Tween, cubic_in_out, cubic_out
+from unrealsdk.unreal import WeakPointer
 
+from .anim import SAFE_PAUSE, field_sink
 from .constants import SLIDE_ANIM_RATE, SLIDE_LEAN_PITCH, SLIDE_LEAN_ROLL
 from .debug import log
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from common import WillowPlayerPawn
 
 _tweens: dict[int, Tween] = {}
@@ -48,6 +52,54 @@ def _kill(key: int) -> None:
         tween.kill()
 
 
+def _body_mesh(pawn: WillowPlayerPawn) -> Any:
+    """The body's skeletal mesh from a live pawn, or None if it (or the pawn) is gone.
+
+    The sinks call this every frame off a weak pointer, so it must tolerate the pawn having been torn
+    down since the tween started. Mirrors `viewmodel._arms_mesh`.
+    """
+    return getattr(pawn, "Mesh", None)
+
+
+def _lean(
+    pawn: WillowPlayerPawn,
+    mesh: Any,
+    key: int,
+    roll: int,
+    pitch: int,
+    duration: float,
+    ease: Callable[[float], float],
+) -> None:
+    """Start a parallel Roll+Pitch lean toward (roll, pitch) over `duration`, tracked under `key`.
+
+    Writes go through weak-pointer-guarded sinks (`anim.field_sink`), so the tween is safe to outlive
+    the pawn. `mesh` is the caller's already-resolved, currently-live mesh, used only to read the
+    starting angles here and now; the sinks re-resolve the live mesh every frame. Same helpers, and
+    same reasoning, as the arm tweens in `viewmodel`.
+    """
+    ref = WeakPointer(pawn)
+    current = mesh.Rotation
+    tween = Tween()
+    tween.tween_callable(
+        field_sink(ref, _body_mesh, "Rotation", "Roll"),
+        start_value=int(current.Roll),
+        final_value=roll,
+        duration=duration,
+    ).transition(ease)
+    tween.tween_callable(
+        field_sink(ref, _body_mesh, "Rotation", "Pitch"),
+        start_value=int(current.Pitch),
+        final_value=pitch,
+        duration=duration,
+    ).transition(ease)
+    tween.set_parallel(True)
+    # Guard the per-frame pause read so a lean still animating into a zone load does not fault on the
+    # tween library's default `get_pc().IsPaused()` gate (None mid-load). See `anim.SAFE_PAUSE`.
+    tween.pause_while(SAFE_PAUSE)
+    tween.start()
+    _tweens[key] = tween
+
+
 def on_pose_start(pawn: WillowPlayerPawn) -> None:
     """Lean the body into the slide. Subscribed to `events.pose_started` in `__init__`."""
     key = _key(pawn)
@@ -62,16 +114,7 @@ def on_pose_start(pawn: WillowPlayerPawn) -> None:
     # Kill a lean still running from an interrupted previous slide before starting a fresh one, or the
     # two interpolators fight over the same Rotation channels.
     _kill(key)
-    tween = Tween()
-    tween.tween_property(mesh.Rotation, "Roll", final_value=SLIDE_LEAN_ROLL, duration=0.25).from_current().transition(
-        cubic_out,
-    )
-    tween.tween_property(mesh.Rotation, "Pitch", final_value=SLIDE_LEAN_PITCH, duration=0.25).from_current().transition(
-        cubic_out,
-    )
-    tween.set_parallel(True)
-    tween.start()
-    _tweens[key] = tween
+    _lean(pawn, mesh, key, roll=SLIDE_LEAN_ROLL, pitch=SLIDE_LEAN_PITCH, duration=0.25, ease=cubic_out)
     # Freeze the engine's skeletal animation so the legs stop the crouch-walk shuffle while sliding.
     # The lean above is a Python tween on the component transform, not engine anim, so it still plays.
     # Restored in on_pose_end. Note this only *stops* the legs in their entry pose - it does not splay
@@ -97,14 +140,5 @@ def on_pose_end(pawn: WillowPlayerPawn) -> None:
     # Un-freeze the skeletal animation (1.0 is the engine default) so the legs move normally again.
     mesh.GlobalAnimRateScale = 1.0
     _kill(key)
-    tween = Tween()
-    tween.tween_property(mesh.Rotation, "Roll", final_value=0, duration=0.3).from_current().transition(
-        cubic_in_out,
-    )
-    tween.tween_property(mesh.Rotation, "Pitch", final_value=0, duration=0.3).from_current().transition(
-        cubic_in_out,
-    )
-    tween.set_parallel(True)
-    tween.start()
-    _tweens[key] = tween
+    _lean(pawn, mesh, key, roll=0, pitch=0, duration=0.3, ease=cubic_in_out)
     log.info("pose.on_pose_end exit reason=settling")
