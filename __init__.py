@@ -10,7 +10,7 @@ from __future__ import annotations
 from mods_base import CoopSupport, build_mod
 from networking import add_network_functions
 
-from . import effects, events, pose, viewmodel
+from . import effects, events, hud, pose, viewmodel
 from .config import all_options
 from .debug import log
 from .hooks import all_hooks
@@ -21,6 +21,8 @@ from .lifecycle import network_functions
 # one more pair of lines and touches nothing else.
 events.slide_started.append(viewmodel.on_start)
 events.slide_ended.append(viewmodel.on_end)
+events.slide_started.append(hud.on_start)
+events.slide_ended.append(hud.on_end)
 events.pose_started.append(pose.on_pose_start)
 events.pose_ended.append(pose.on_pose_end)
 events.pose_started.append(effects.on_start)
@@ -40,7 +42,7 @@ def _on_disable() -> None:
 # Both of these only scan the calling module's scope, so the lists have to be handed over
 # explicitly - relying on auto-discovery here would silently register nothing at all.
 mod = build_mod(
-    hooks=all_hooks,
+    hooks=[*all_hooks, *hud.hud_hooks],
     options=all_options,
     on_enable=_on_enable,
     on_disable=_on_disable,
