@@ -222,21 +222,21 @@ def draw_slide_icon(
     if tex is None or not rects or _ICON is None:
         return
 
-    # Paint the icon: map its pixel grid into a box the size of the crouch clip (scaled by ICON_SCALE),
-    # centred on the crouch anchor. Each baked rect becomes one solid-colour DrawRect. Colour must go
-    # through SetDrawColorStruct with a real Color struct - SetDrawColor()/the DrawColor property both
-    # silently no-op on this Canvas (they drew black).
-    box_w = tw * ICON_SCALE
-    box_h = th * ICON_SCALE
-    px_w = box_w / float(_ICON["w"])
-    px_h = box_h / float(_ICON["h"])
+    # Paint the icon centred on the crouch anchor. Use ONE uniform pixel size so the art keeps its own
+    # aspect ratio - deriving width and height separately from the crouch box (whose per-axis screen
+    # scale differs) stretched it. Height sets the scale; width follows from the icon's own proportions.
+    px = (th * ICON_SCALE) / float(_ICON["h"])
+    box_w = float(_ICON["w"]) * px
+    box_h = float(_ICON["h"]) * px
     ox = cx - box_w / 2.0
     oy = cy - box_h / 2.0
+    # Colour must go through SetDrawColorStruct with a real Color struct - SetDrawColor()/the DrawColor
+    # property both silently no-op on this Canvas (they drew black).
     try:
         for rx, ry, rw, rh, color in rects:
             canvas.SetDrawColorStruct(color)
-            canvas.SetPos(ox + rx * px_w, oy + ry * px_h)
-            canvas.DrawRect(rw * px_w, rh * px_h, tex)
+            canvas.SetPos(ox + rx * px, oy + ry * px)
+            canvas.DrawRect(rw * px, rh * px, tex)
     except Exception as ex:  # noqa: BLE001 - a failed HUD draw must never break the frame
         log.warning(f"hud draw_slide_icon failed {type(ex).__name__}: {ex}")
 
