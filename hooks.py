@@ -20,7 +20,7 @@ from .constants import POST_LOG_EVERY, SLIDE_MIN_SPEED_FRACTION
 from .debug import every_n, log
 from .lifecycle import enter_slide, server_set_slide_jump_velocity
 from .movement import steer_heading
-from .state import OWN_SLIDE_STATE, State, is_client, pawn_deleting, player_id, state_for
+from .state import OWN_SLIDE_STATE, State, is_client, on_ground, pawn_deleting, player_id, state_for
 
 if TYPE_CHECKING:
     from common import WillowPlayerController, WillowPlayerPawn
@@ -142,9 +142,13 @@ def handle_duck(
     pc = cast("WillowPlayerController", obj.Outer)
     pawn = cast("WillowPlayerPawn", pc.Pawn)
     sprinting = bool(pc.bInSprintState)
+    # A slide must start from the ground - a sprint-jump keeps `bInSprintState` and full velocity in the
+    # air, so without this a mid-air crouch would open a slide. `on_ground` reads the Physics byte (safe
+    # to call every input; see state.on_ground) and matches the crouch/ground continue gate in can_slide.
+    grounded = pawn is not None and on_ground(pawn)
     fast_enough = pawn is not None and _at_slide_speed(pawn)
-    log.info(f"handle_duck enter sprinting={sprinting} fast_enough={fast_enough}")
-    if sprinting and fast_enough:
+    log.info(f"handle_duck enter sprinting={sprinting} grounded={grounded} fast_enough={fast_enough}")
+    if sprinting and grounded and fast_enough:
         # enter_slide starts a driver and sends a message; a raise from either would leave state
         # half-populated. Log and continue so one bad slide cannot wedge every later one.
         try:

@@ -10,8 +10,8 @@ itself a crouch, so hiding the crouch icon is what "replaces" it; the slide icon
 The slide icon is a Canvas overlay drawn in `WillowGameViewportClient.PostRender` while sliding - BL2's
 HUD is fully Scaleform, so the classic `HUD.PostRender`/`DrawHUD` script path never fires; the viewport
 client's PostRender is the render entry that does, and it carries the `Canvas` as an argument. As a POST
-hook it runs after the HUD movie has rendered, so the draw lands on top. The art is a placeholder for
-now - swapped for the supplied icon texture once it lands.
+hook it runs after the HUD movie has rendered, so the draw lands on top. The art is a real Texture2D
+loaded from a bundled package and drawn with a single DrawTile (see `_ensure_texture`).
 
 No game state; only reacts to slide events, plus the render hook for the overlay - like viewmodel /
 pose / effects. Runs on: LOCAL MACHINE only. The HUD is per-player, and the slide events it hangs off
@@ -21,51 +21,53 @@ pose / effects. Runs on: LOCAL MACHINE only. The HUD is per-player, and the slid
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
-from mods_base import hook
+import unrealsdk
+from mods_base import get_pc, hook
 from unrealsdk import make_struct, unreal
 from unrealsdk.hooks import Type
 
+from . import config
+from .constants import (
+    BLEND_TRANSLUCENT,
+    CROUCH_CLIP_PATH,
+    CROUCH_SHOWN_FRAME,
+    HUD_STAGE_H,
+    HUD_STAGE_W,
+    RF_STANDALONE,
+    SLIDE_ICON_FRAC_X,
+    SLIDE_ICON_FRAC_Y,
+    SLIDE_ICON_OBJECT,
+    SLIDE_ICON_PACKAGE,
+    SLIDE_ICON_SCALE,
+)
 from .debug import log
 
-CROUCH_CLIP_PATH = "_level0.p1.crouch"
-"""ActionScript path of the native crouch indicator clip inside WillowHUDGFxMovie (found via the
-gfx_enum probe: a direct child of the player-1 HUD root `p1`)."""
+# The slide icon ships as a real Texture2D in a BL2 package (assets/sliding_slideicon.upk, built from
+# assets/slide.png by tools/build_icon_upk.py). Runtime Canvas rect-painting was too slow (~7000
+# rects/frame); a single DrawTile of a texture is one call. The package is copied into the game's
+# CookedPCConsole on first use so BL2 finds it by name (see SLIDE_ICON_PACKAGE) and manages its
+# lifetime like any cooked asset; the texture is then GC-rooted with RF_Standalone so it is never
+# collected. Only the __file__-derived on-disk locations live here; the value constants are in constants.
+_ASSET_DIR = Path(__file__).resolve().parent / "assets"
+_ASSET_UPK = _ASSET_DIR / f"{SLIDE_ICON_PACKAGE}.upk"
+_META_PATH = _ASSET_DIR / "slide_icon_meta.json"
+# CookedPCConsole sits two levels up from sdk_mods/sliding, under WillowGame.
+_COOKED_DIR = Path(__file__).resolve().parents[2] / "WillowGame" / "CookedPCConsole"
 
-# The slide icon, baked from assets/slide.png into same-colour rectangles by tools/build_icon.py. BL2
-# can't load a custom Texture2D at runtime (mip pixels are unwritable) and GFx external image loading
-# crashes - but the Canvas can draw solid-colour rects, so we paint the icon as its ~700 rects. Loaded
-# once here; the Color structs are built lazily on first draw (make_struct needs the SDK up).
-_ICON_PATH = Path(__file__).resolve().parent / "assets" / "slide_icon.json"
 
-
-def _load_icon() -> dict[str, Any] | None:
+def _load_meta() -> dict[str, Any]:
     try:
-        return json.loads(_ICON_PATH.read_text(encoding="utf-8"))
-    except Exception as ex:  # noqa: BLE001 - a missing/broken icon just means no overlay art
-        log.warning(f"hud icon load failed {type(ex).__name__}: {ex}")
-        return None
+        return json.loads(_META_PATH.read_text(encoding="utf-8"))
+    except Exception as ex:  # noqa: BLE001 - fall back to whole-texture UVs if the meta is missing
+        log.warning(f"hud icon meta load failed {type(ex).__name__}: {ex}")
+        return {}
 
 
-_ICON = _load_icon()
-
-# The HUD movie's authored stage, and how it maps to the screen. `scaleMode = exactFit` stretches the
-# 1280x720 stage across the whole viewport (aspect-distorted), so a stage coordinate maps to a pixel by
-# `screen = stage / STAGE_DIM * canvas_dim` at any resolution. Confirmed by the gfx_stage probe: the
-# crosshairs clip's anchor lands at stage (640, 360) = dead centre, where the reticle draws.
-STAGE_W = 1280.0
-STAGE_H = 720.0
-
-# Fallback position (fraction of canvas) if the crouch clip's live coords can't be read - the measured
-# stage anchor (p1 + crouch = 570.3, 407.55) over the stage, i.e. where the crouch icon sits.
-ICON_FRAC_X = 570.3 / STAGE_W
-ICON_FRAC_Y = 407.55 / STAGE_H
-
-# Overall size of the drawn icon relative to the crouch clip's on-screen box. 1.0 matches the native
-# crouch icon's size; bump it up to make the slide icon bigger. Position/size are still being tuned.
-ICON_SCALE = 1.0
+_META = _load_meta()
 
 
 class _State:
@@ -76,19 +78,57 @@ class _State:
     # (stage_x, stage_y, stage_w, stage_h) of the crouch clip, cached at slide start (the HUD layout is
     # static, so we read it once rather than every frame). None until computed / if the clip is absent.
     icon_stage: tuple[float, float, float, float] | None = None
-    # The icon's rects as (x, y, w, h, Color) with the Color struct pre-built, so the per-frame draw
-    # loop does no allocation. None until built on the first draw (make_struct needs the SDK loaded).
-    icon_rects: list[tuple[int, int, int, int, Any]] | None = None
+    # The loaded slide Texture2D (GC-rooted), plus the modulation structs the per-frame DrawTile needs,
+    # pre-built so the draw allocates nothing. All None until loaded / built on first use.
+    tex: Any = None
+    tint: Any = None        # LinearColor(1,1,1,1) passed to DrawTile
+    draw_color: Any = None  # opaque white Color for SetDrawColorStruct
 
 
-def _icon_rects() -> list[tuple[int, int, int, int, Any]]:
-    """Icon rects with their Color structs, built once and cached."""
-    if _State.icon_rects is None:
-        rects: list[tuple[int, int, int, int, Any]] = []
-        for x, y, w, h, r, g, b, a in (_ICON["rects"] if _ICON else []):
-            rects.append((x, y, w, h, make_struct("Color", R=r, G=g, B=b, A=a)))
-        _State.icon_rects = rects
-    return _State.icon_rects
+def _colors() -> tuple[Any, Any]:
+    """The DrawTile tint (LinearColor) and the SetDrawColorStruct value (Color), built once and cached
+    (make_struct needs the SDK up, so this is lazy rather than module-level)."""
+    if _State.tint is None:
+        _State.tint = make_struct("LinearColor", R=1.0, G=1.0, B=1.0, A=1.0)
+        _State.draw_color = make_struct("Color", R=255, G=255, B=255, A=255)
+    return _State.tint, _State.draw_color
+
+
+def _ensure_texture() -> Any:
+    """Load the slide Texture2D once and return it, or None on failure.
+
+    Copies the packaged .upk into CookedPCConsole if it isn't there yet (so BL2 finds it by name and
+    owns its lifetime), loads it, then sets RF_Standalone so the engine GC never collects it. Every
+    failure is swallowed to None - a missing icon must never break the slide, only skip the overlay.
+    """
+    if _State.tex is not None:
+        return _State.tex
+    try:
+        dest = _COOKED_DIR / _ASSET_UPK.name
+        # Copy when absent OR when the bundled .upk is newer than the deployed copy (so a rebuilt icon
+        # is picked up on the next launch). copy2 preserves mtime, so this won't re-fire once in sync.
+        # Wrapped on its own: if the deployed file is locked (busy) or the copy fails, fall through and
+        # load whatever is already there rather than aborting the whole load - a stale icon beats none.
+        try:
+            if _ASSET_UPK.exists() and _COOKED_DIR.is_dir() and (
+                not dest.exists() or _ASSET_UPK.stat().st_mtime > dest.stat().st_mtime
+            ):
+                shutil.copy2(_ASSET_UPK, dest)
+                log.info(f"hud copied slide icon package -> {dest}")
+        except OSError as ex:
+            log.info(f"hud slide icon copy skipped ({type(ex).__name__}: {ex}) - using deployed copy")
+        try:
+            unrealsdk.load_package(SLIDE_ICON_PACKAGE)
+        except Exception:  # noqa: BLE001 - by-name can miss a just-copied file; load it by path
+            unrealsdk.load_package(str(dest if dest.exists() else _ASSET_UPK))
+        tex = unrealsdk.find_object("Texture2D", SLIDE_ICON_OBJECT)
+        tex.ObjectFlags |= RF_STANDALONE
+        _State.tex = tex
+        log.info(f"hud slide texture loaded {tex!r} flags=0x{int(tex.ObjectFlags):016X}")
+    except Exception as ex:  # noqa: BLE001 - no texture just means no overlay art
+        log.warning(f"hud slide texture load failed {type(ex).__name__}: {ex}")
+        _State.tex = None
+    return _State.tex
 
 
 def _hud_movie(pc: Any) -> Any:
@@ -147,6 +187,38 @@ def _set_crouch_visible(pc: Any, visible: bool) -> None:
         log.warning(f"hud SetVisible failed {type(ex).__name__}: {ex}")
 
 
+def _paused() -> bool:
+    """Whether the game is paused or in a menu, where the slide icon should not draw. Mirrors the pause
+    read the mod uses elsewhere (lifecycle); a missing/unreadable controller counts as paused so the
+    icon errs toward hidden.
+    """
+    try:
+        pc = get_pc(possibly_loading=True)
+        return pc is None or bool(pc.IsPaused())
+    except Exception:  # noqa: BLE001 - an unreadable state is treated as paused (hide the icon)
+        return True
+
+
+def _apply_crouch_override() -> None:
+    """Force the native crouch icon visible + on its shown frame every frame, when the user has enabled
+    "Always Show Crouch Icon". No-op otherwise, so the normal case keeps its cheap one-shot hide/show
+    in on_start/on_end. Runs from the per-frame render hook; all failures are cosmetic and swallowed.
+    """
+    if not config.always_show_crouch_icon.value:
+        return
+    pc = get_pc(possibly_loading=True)
+    if pc is None:
+        return
+    clip = _crouch_clip(_hud_movie(pc))
+    if clip is None:
+        return
+    try:
+        clip.SetVisible(True)
+        clip.GotoAndStopI(CROUCH_SHOWN_FRAME)
+    except Exception as ex:  # noqa: BLE001 - a cosmetic HUD failure must never break the frame
+        log.info(f"hud crouch override failed {type(ex).__name__}: {ex}")
+
+
 def on_start(pc: Any) -> None:
     """Hide the native crouch icon and start drawing the slide icon. Subscribed to `slide_started`."""
     log.info("hud.on_start enter")
@@ -154,7 +226,10 @@ def on_start(pc: Any) -> None:
     _State.logged_render = False  # re-arm the per-slide "did the draw hook fire" log
     movie = _hud_movie(pc)
     _State.icon_stage = _read_icon_stage(movie)
-    _set_crouch_visible(pc, False)
+    # Leave the crouch icon alone when the user wants it kept on screen; _apply_crouch_override drives
+    # it every frame in that mode.
+    if not config.always_show_crouch_icon.value:
+        _set_crouch_visible(pc, False)
     log.info(f"hud.on_start exit icon_stage={_State.icon_stage}")
 
 
@@ -182,10 +257,17 @@ def draw_slide_icon(
 
     Hooked on the viewport client's PostRender (the one render entry BL2 actually fires - the HUD's own
     PostRender/DrawHUD never run under its Scaleform HUD), with the `Canvas` taken from the call args.
-    POST so it draws after the HUD movie. The icon is painted as solid-colour rectangles (see
-    `_icon_rects`) since BL2 can't load a custom texture at runtime.
+    POST so it draws after the HUD movie. The icon is one DrawTile of the bundled slide Texture2D
+    (see `_ensure_texture`), centred on the crouch anchor.
+
+    Two options steer it: "Always Show Slide Icon" draws it even when not sliding (for positioning),
+    and "Always Show Crouch Icon" keeps the native crouch icon on screen (see `_apply_crouch_override`).
     """
-    if not _State.is_sliding:
+    # Crouch-icon override runs every frame, independent of whether the slide icon draws.
+    _apply_crouch_override()
+    # Draw while sliding, but not over menus / a paused game. "Always Show Slide Icon" forces it on and
+    # ignores both the slide state and the pause state.
+    if not config.always_show_slide_icon.value and (not _State.is_sliding or _paused()):
         return
     canvas = getattr(args, "Canvas", None)
     if canvas is None:
@@ -202,41 +284,59 @@ def draw_slide_icon(
     stage = _State.icon_stage
     if stage is not None:
         gx, gy, gw, gh = stage
-        cx = gx / STAGE_W * w
-        cy = gy / STAGE_H * h
-        tw = gw / STAGE_W * w
-        th = gh / STAGE_H * h
+        cx = gx / HUD_STAGE_W * w
+        cy = gy / HUD_STAGE_H * h
+        tw = gw / HUD_STAGE_W * w
+        th = gh / HUD_STAGE_H * h
     else:
-        cx = w * ICON_FRAC_X
-        cy = h * ICON_FRAC_Y
+        cx = w * SLIDE_ICON_FRAC_X
+        cy = h * SLIDE_ICON_FRAC_Y
         tw = th = h * 0.06
 
-    tex = getattr(canvas, "DefaultTexture", None)
-    rects = _icon_rects()
+    # Nudge onto the native crouch icon: its clip anchor sits up-left of the visible icon. The offset is
+    # user-tunable (Slide Icon X/Y Offset), in stage units so it stays resolution-independent (exactFit).
+    cx += float(config.icon_offset_x.value) / HUD_STAGE_W * w
+    cy += float(config.icon_offset_y.value) / HUD_STAGE_H * h
+
+    # Load the texture lazily HERE, in the PostRender context - load_package hard-faults the game if
+    # called from the slide-event dispatch (game-thread mid-tick); PostRender is the verified-safe entry
+    # (the dev bridge loads/draws this exact texture from the same hook). Guarded to load only once.
+    was_loaded = _State.tex is not None
+    tex = _ensure_texture()
+    if tex is not None and not was_loaded:
+        # Loaded on THIS frame - give the GPU resource a frame to finish initialising before DrawTile
+        # touches it, so we never draw a not-yet-ready (null) resource. Drawing resumes next frame.
+        return
+    # Source region: the icon occupies the top-left content_w x content_h of the padded (power-of-two)
+    # texture, so sample just that and leave the transparent pad out.
+    cw = float(_META.get("content_w", 0)) or (float(tex.SizeX) if tex is not None else 0.0)
+    ch = float(_META.get("content_h", 0)) or (float(tex.SizeY) if tex is not None else 0.0)
     if not _State.logged_render:
         _State.logged_render = True
         log.info(
             f"hud draw_slide_icon fired canvas=({w:.0f}x{h:.0f}) box=({tw:.0f}x{th:.0f})"
-            f" at ({cx:.0f},{cy:.0f}) rects={len(rects)} tex={tex!r}"
+            f" at ({cx:.0f},{cy:.0f}) tex={tex!r} content=({cw:.0f}x{ch:.0f})"
         )
-    if tex is None or not rects or _ICON is None:
+    if tex is None or ch <= 0.0:
         return
 
-    # Paint the icon centred on the crouch anchor. Use ONE uniform pixel size so the art keeps its own
-    # aspect ratio - deriving width and height separately from the crouch box (whose per-axis screen
-    # scale differs) stretched it. Height sets the scale; width follows from the icon's own proportions.
-    px = (th * ICON_SCALE) / float(_ICON["h"])
-    box_w = float(_ICON["w"]) * px
-    box_h = float(_ICON["h"]) * px
-    ox = cx - box_w / 2.0
-    oy = cy - box_h / 2.0
-    # Colour must go through SetDrawColorStruct with a real Color struct - SetDrawColor()/the DrawColor
-    # property both silently no-op on this Canvas (they drew black).
+    # Size relative to the crouch box (resolution-independent, centred on its anchor) so it matches the
+    # crouch icon it replaces. Height sets the scale; width follows the icon's own aspect (the crouch
+    # box's per-axis screen scale differs, so deriving both from it would stretch the art). Crispness
+    # comes from a supersampled source + clean mips, not from native-size drawing. Snap origin to whole
+    # pixels so the sampler lands cleanly.
+    scale = (th * SLIDE_ICON_SCALE) / ch
+    box_w = cw * scale
+    box_h = ch * scale
+    ox = float(round(cx - box_w / 2.0))
+    oy = float(round(cy - box_h / 2.0))
+    tint, draw_color = _colors()
     try:
-        for rx, ry, rw, rh, color in rects:
-            canvas.SetDrawColorStruct(color)
-            canvas.SetPos(ox + rx * px, oy + ry * px)
-            canvas.DrawRect(rw * px, rh * px, tex)
+        canvas.SetDrawColorStruct(draw_color)
+        canvas.SetPos(ox, oy)
+        # DrawTile(Tex, XL, YL, U, V, UL, VL, LColor, ClipTile, Blend): the cw x ch source region scaled
+        # to box_w x box_h. BLEND_Translucent honours the texture's alpha (default blend draws opaque).
+        canvas.DrawTile(tex, box_w, box_h, 0.0, 0.0, cw, ch, tint, False, BLEND_TRANSLUCENT)
     except Exception as ex:  # noqa: BLE001 - a failed HUD draw must never break the frame
         log.warning(f"hud draw_slide_icon failed {type(ex).__name__}: {ex}")
 
